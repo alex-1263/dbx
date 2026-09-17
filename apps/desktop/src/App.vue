@@ -53,6 +53,7 @@ import { translateBackendError } from "@/i18n/backend-errors";
 import * as api from "@/lib/backend/api";
 import { connectionRedactedNameLabel } from "@/lib/connection/connectionPresentation";
 import { quickConnectionOpenTarget } from "@/lib/connection/connectionOpenTarget";
+import { OBJECT_BROWSER_SEARCH_FOCUS_EVENT, objectBrowserSearchFocusTabId } from "@/lib/tabs/objectBrowserSearchFocus";
 import { parseRecentConnectionIds, rankRecentConnections, RECENT_CONNECTION_IDS_STORAGE_KEY, recordRecentConnection } from "@/lib/connection/recentConnections";
 import { resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { normalizeSqliteNamespace } from "@/lib/database/sqliteNamespace";
@@ -71,6 +72,7 @@ import { rememberExternalSqlFileTarget, resolveExternalSqlFileTarget, unassociat
 import { externalSqlFileOpenErrorMessage, externalSqlEditorMaxBytes, isSqlFilePath, readBrowserSqlFile, sqlFileTitleFromPath } from "@/lib/sql/sqlFileOpen";
 import type { ConnectionConfig, DatabaseType, ObjectBrowserFilter, ObjectSourceKind, QueryTab, TabOutputView, TreeNode } from "@/types/database";
 import type { PluginCenterFocus } from "@/lib/plugins/pluginCenterNavigation";
+import { parsePluginInstallDeepLink } from "@/lib/plugins/pluginInstallDeepLink";
 import { parseConnectionDeepLink, type ConnectionDeepLinkDraft } from "@/lib/connection/connectionDeepLink";
 import { parseAiConfigDeepLink, type AiConfigDeepLinkDraft } from "@/lib/ai/aiConfigDeepLink";
 import { activeDesktopAiRuns, blockingDesktopAiRunsForQuit } from "@/lib/ai/desktopAiRunRegistry";
@@ -104,6 +106,7 @@ import {
   tabSwitcherDirectionFromShortcut,
 } from "@/lib/editor/keyboardShortcuts";
 import { createTabNavigationHistory, moveInTabNavigationHistory, recordTabVisit } from "@/lib/tabs/tabNavigationHistory";
+import { canSaveSqlTab } from "@/lib/tabs/sqlTabSaveTarget";
 import { initialTabSwitcherSelection, moveTabSwitcherSelection, tabSwitcherOrder } from "@/lib/tabs/tabSwitcher";
 import { createTabSwitcherKeyboardController } from "@/lib/tabs/tabSwitcherKeyboard";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
@@ -173,9 +176,12 @@ type AiAssistantHandle = {
   setPrompt: (text: string) => void;
   addTableMention: (target: { schema?: string; table: string }) => void;
   clearContextReferences: () => void;
+  focusSearch: () => boolean;
   /** Opens a conversation by id (used by the background-run toast, §9). */
   selectConversationById: (conversationId: string) => void;
 };
+
+type AuxiliarySearchSurface = "ai" | "history" | "sqlLibrary" | null;
 
 const { t } = useI18n();
 const connectionStore = useConnectionStore();
@@ -364,6 +370,8 @@ const aiAssistantRef = ref<AiAssistantHandle | null>(null);
 const appSidebarRef = ref<InstanceType<typeof AppSidebar> | null>(null);
 const appTabBarRef = ref<InstanceType<typeof AppTabBar> | null>(null);
 const contentAreaRef = ref<InstanceType<typeof SqlEditorWorkspace> | null>(null);
+const lastFocusedAuxiliarySurface = ref<AuxiliarySearchSurface>(null);
+const lastFocusedSidebarSurface = ref(false);
 
 const selectedSql = ref("");
 const cursorPos = ref(0);
@@ -999,6 +1007,7 @@ const { setupTauriListeners, cleanupTauriListeners } = useTauriEvents({
   openConnectionDeepLink,
   closeActiveSurface,
   openAiConfigDeepLink,
+  openPluginInstallDeepLink,
 });
 const { showCloseActionPrompt, chooseQuit, chooseMinimize, cancelCloseActionPrompt, performCloseAction, setupCloseActionPromptListener, cleanupCloseActionPromptListener } = useCloseActionPrompt({ requestClose: requestAppClose });
 useVisibilityChange();
@@ -1058,6 +1067,19 @@ function activateSettingsPage() {
 
 function activateQuerySurface() {
   activateMainContentSurface("query");
+}
+
+async function focusRequestedObjectBrowserSearch(event: Event) {
+  const tabId = objectBrowserSearchFocusTabId(event);
+  if (!tabId) return;
+  await nextTick();
+  let remainingFrames = 8;
+  const focusWhenReady = () => {
+    if (queryStore.activeTabId !== tabId || contentAreaRef.value?.focusSearch()) return;
+    remainingFrames -= 1;
+    if (remainingFrames > 0) window.requestAnimationFrame(focusWhenReady);
+  };
+  focusWhenReady();
 }
 
 function activateOpenSpecialPageFallback() {
@@ -1426,6 +1448,10 @@ function setRightSidebarPanelOpen(panelId: RightSidebarPanelId, open: boolean) {
   applyRightSidebarPanelState(transitionRightSidebarPanels(currentRightSidebarPanelState(), panelId, open, exclusive));
   if (open) {
     lastOpenedRightSidebarPanel = panelId;
+    if (panelId === "ai" || panelId === "history" || panelId === "sqlLibrary") {
+      lastFocusedAuxiliarySurface.value = panelId;
+      lastFocusedSidebarSurface.value = false;
+    }
   } else if (lastOpenedRightSidebarPanel === panelId) {
     lastOpenedRightSidebarPanel = RIGHT_SIDEBAR_PANEL_IDS.find((candidate) => rightSidebarPanelRefs[candidate].value);
   }
@@ -1656,10 +1682,6 @@ function finishSqlLibraryFlyAnimation(animationId: number) {
   window.clearTimeout(sqlLibraryFlyAnimationTimer);
   sqlLibraryFlyAnimation.value = null;
   sqlLibrarySaveFeedbackId.value += 1;
-}
-
-function canSaveSqlTab(tab: QueryTab): boolean {
-  return !!tab.externalSqlPath || !!tab.sql.trim();
 }
 
 function closePendingSavedTab() {
@@ -2366,6 +2388,37 @@ async function openPendingAiConfigLinks() {
     const links = await api.pendingOpenAiConfigLinks();
     for (const link of links) {
       await openAiConfigDeepLink(link);
+    }
+  } catch {
+    /* ignore startup deep-link probing errors */
+  }
+}
+
+const pluginCenterInstallRequest = ref<{ id: number; url: string } | null>(null);
+let pluginInstallDeepLinkId = 0;
+
+async function openPluginInstallDeepLink(url: string) {
+  try {
+    const draft = parsePluginInstallDeepLink(url);
+    if (!draft) return;
+    pluginCenterInstallRequest.value = { id: ++pluginInstallDeepLinkId, url: draft.url };
+    openPluginCenterPage();
+  } catch (e: any) {
+    toast(
+      t("pluginPlatform.deepLinkInvalid", {
+        message: e?.message || String(e),
+      }),
+      5000,
+    );
+  }
+}
+
+async function openPendingPluginInstallLinks() {
+  if (!isTauriRuntime()) return;
+  try {
+    const links = await api.pendingOpenPluginInstallLinks();
+    for (const link of links) {
+      await openPluginInstallDeepLink(link);
     }
   } catch {
     /* ignore startup deep-link probing errors */
@@ -3115,6 +3168,14 @@ function handleTabSwitcherKeydownCapture(e: KeyboardEvent) {
   tabSwitcherKeyboard.handleKeydownCapture(e);
 }
 
+function handleAuxiliarySearchKeydownCapture(e: KeyboardEvent) {
+  if (e.defaultPrevented || !isFocusSearchShortcut(e, settingsStore.editorSettings.shortcuts)) return;
+  const target = e.target instanceof Element ? e.target : document.activeElement instanceof Element ? document.activeElement : null;
+  if (!focusSearchInAuxiliarySurface(target)) return;
+  e.preventDefault();
+  e.stopPropagation();
+}
+
 function handleTabSwitcherWindowBlur() {
   tabSwitcherKeyboard.handleWindowBlur();
 }
@@ -3145,6 +3206,59 @@ const tabSwitcherKeyboard = createTabSwitcherKeyboardController({
 
 function handleNativeSelectAll(e: KeyboardEvent) {
   if (shouldBlockAppNativeSelectAll(e)) e.preventDefault();
+}
+
+function focusSearchInput(selector: string): boolean {
+  const input = Array.from(document.querySelectorAll<HTMLInputElement>(selector)).find((candidate) => candidate.getClientRects().length > 0);
+  if (!input) return false;
+  input.focus();
+  input.select();
+  return true;
+}
+
+function focusSearchInAuxiliarySurface(target: Element | null): boolean {
+  if (showConnectionDialog.value) {
+    // The dialog is modal: keep the shortcut inside it and never focus a
+    // surface hidden behind the overlay, even when its search input is absent.
+    focusSearchInput("[data-connection-db-search]");
+    return true;
+  }
+  if (showSettingsPage.value) return focusSearchInput("[data-settings-global-search]");
+  if (showDriverStore.value) {
+    const selector = driverStoreActiveTab.value === "jdbc" ? "[data-driver-store-jdbc-search]" : "[data-driver-store-agent-search]";
+    return focusSearchInput(selector);
+  }
+  if (showPluginCenter.value) return focusSearchInput("[data-plugin-marketplace-search]");
+
+  if (showAiPanel.value && target?.closest("[data-ai-assistant-root], [data-ai-conversation-search]")) {
+    if (aiAssistantRef.value) return aiAssistantRef.value.focusSearch();
+    invokeWhenAiReady((handle) => handle.focusSearch());
+    return true;
+  }
+  if (showHistory.value && target?.closest("[data-history-panel], [data-history-search]")) return focusSearchInput("[data-history-search]");
+  if (showSqlLibraryPanel.value && target?.closest("[data-sql-library-panel], [data-sql-library-search]")) return focusSearchInput("[data-sql-library-search]");
+
+  const targetIsDocument = !target || target === document.body || target === document.documentElement;
+  if (!targetIsDocument) return false;
+  if (lastFocusedSidebarSurface.value) return false;
+
+  if (lastFocusedAuxiliarySurface.value === "ai" && showAiPanel.value) {
+    if (aiAssistantRef.value) return aiAssistantRef.value.focusSearch();
+    invokeWhenAiReady((handle) => handle.focusSearch());
+    return true;
+  }
+  if (lastFocusedAuxiliarySurface.value === "history" && showHistory.value) return focusSearchInput("[data-history-search]");
+  if (lastFocusedAuxiliarySurface.value === "sqlLibrary" && showSqlLibraryPanel.value) return focusSearchInput("[data-sql-library-search]");
+  return false;
+}
+
+function rememberAuxiliarySearchSurface(surface: Exclude<AuxiliarySearchSurface, null>) {
+  lastFocusedAuxiliarySurface.value = surface;
+  lastFocusedSidebarSurface.value = false;
+}
+
+function rememberSidebarSearchSurface() {
+  lastFocusedSidebarSurface.value = true;
 }
 
 function setPluginWorkbenchTabRef(tabId: string, element: unknown) {
@@ -3219,9 +3333,13 @@ async function handleKeydown(e: KeyboardEvent) {
     return;
   }
   if (isFocusSearchShortcut(e, shortcuts)) {
-    // Route by the event target so focus inside the shared result grid (or a
-    // Teleported cell-detail dialog) lands on the result search, not the editor.
-    const focused = contentAreaRef.value?.focusSearch(e.target instanceof Element ? e.target : null) || appSidebarRef.value?.focusSearch();
+    // Keep the focused navigation surface ahead of the active content tab.
+    // Otherwise Ctrl+F from empty space in the sidebar incorrectly opens the
+    // search belonging to the active table/query tab.
+    const target = e.target instanceof Element ? e.target : null;
+    const targetIsDocument = !target || target === document.body || target === document.documentElement;
+    const sidebarFocused = target?.closest("[data-app-sidebar]") || (targetIsDocument && lastFocusedSidebarSurface.value);
+    const focused = sidebarFocused ? appSidebarRef.value?.focusSearch(target) : focusSearchInAuxiliarySurface(target) || contentAreaRef.value?.focusSearch(target) || appSidebarRef.value?.focusSearch(target);
     if (focused) {
       e.preventDefault();
       e.stopPropagation();
@@ -3514,12 +3632,14 @@ onMounted(async () => {
   void applyUiScale(settingsStore.editorSettings.uiScale);
   window.addEventListener("keydown", handleNativeSelectAll, true);
   window.addEventListener("keydown", handleTabSwitcherKeydownCapture, true);
+  window.addEventListener("keydown", handleAuxiliarySearchKeydownCapture, true);
   window.addEventListener("keydown", handleKeydown);
   window.addEventListener("keyup", handleKeyup, true);
   window.addEventListener("blur", handleTabSwitcherWindowBlur);
   document.addEventListener("visibilitychange", handleTabSwitcherVisibilityChange);
   window.addEventListener("dbx-open-driver-store", openDriverStoreFromEvent);
   window.addEventListener("dbx:activate-query-surface", activateQuerySurface);
+  window.addEventListener(OBJECT_BROWSER_SEARCH_FOCUS_EVENT, focusRequestedObjectBrowserSearch);
   window.addEventListener("dbx-mcp-status-changed", handleMcpStatusChanged);
   window.addEventListener("dbx:ai-run-notify", handleAiRunNotify);
   if (isDesktop) {
@@ -3579,6 +3699,7 @@ onMounted(async () => {
   void openPendingDbFiles();
   void openPendingConnectionLinks();
   void openPendingAiConfigLinks();
+  void openPendingPluginInstallLinks();
   console.log(`[STARTUP] onMounted sync done: ${(performance.now() - mountStart).toFixed(0)}ms`);
 });
 
@@ -3594,6 +3715,7 @@ onUnmounted(() => {
   }
   window.removeEventListener("keydown", handleNativeSelectAll, true);
   window.removeEventListener("keydown", handleTabSwitcherKeydownCapture, true);
+  window.removeEventListener("keydown", handleAuxiliarySearchKeydownCapture, true);
   window.removeEventListener("keydown", handleKeydown);
   window.removeEventListener("keyup", handleKeyup, true);
   window.removeEventListener("blur", handleTabSwitcherWindowBlur);
@@ -3601,6 +3723,7 @@ onUnmounted(() => {
   tabSwitcherKeyboard.reset();
   window.removeEventListener("dbx-open-driver-store", openDriverStoreFromEvent);
   window.removeEventListener("dbx:activate-query-surface", activateQuerySurface);
+  window.removeEventListener(OBJECT_BROWSER_SEARCH_FOCUS_EVENT, focusRequestedObjectBrowserSearch);
   window.removeEventListener("dbx-mcp-status-changed", handleMcpStatusChanged);
   window.removeEventListener("dbx:ai-run-notify", handleAiRunNotify);
   document.removeEventListener("contextmenu", handleContextMenu);
@@ -3674,6 +3797,7 @@ onUnmounted(() => {
             @collapse="setSidebarOpen(false)"
             @open-settings="(initialTab) => openSettings(initialTab ?? 'appearance')"
             @add-to-ai="addToAi"
+            @mousedown="rememberSidebarSearchSurface"
           />
 
           <div v-show="!isAiPanelMaximized || isZenMode" :class="isDetachedWindowContext ? 'flex-1 min-w-0 overflow-hidden bg-background' : isClassicLayout ? 'flex-1 min-w-0 overflow-hidden' : 'flex-1 min-w-0 overflow-hidden rounded-md border border-border/80 bg-background'">
@@ -3707,7 +3831,7 @@ onUnmounted(() => {
                 @detach-tab="detachTab"
               >
                 <DriverStorePage v-if="driverStoreTabOpen" v-show="driverStoreActive" v-model:active-tab="driverStoreActiveTab" class="flex-1 min-h-0" :update-notifications-enabled="updateNotificationsEnabled" :focus-target="driverStoreFocus" @update-count-change="updateAgentDriverUpdateCount" />
-                <PluginCenterPage v-if="pluginCenterTabOpen" v-show="pluginCenterActive" class="flex-1 min-h-0" :focus-target="pluginCenterFocus" @new-connection="openPluginConnectionDialog" />
+                <PluginCenterPage v-if="pluginCenterTabOpen" v-show="pluginCenterActive" class="flex-1 min-h-0" :focus-target="pluginCenterFocus" :install-url-request="pluginCenterInstallRequest" @new-connection="openPluginConnectionDialog" />
                 <EditorSettingsPage
                   v-if="settingsPageTabOpen"
                   v-show="settingsStore.settingsPageActive"
@@ -3924,7 +4048,7 @@ onUnmounted(() => {
             :style="isAiPanelMaximized ? {} : { width: aiPanelWidth + 'px' }"
           >
             <div v-if="!isAiPanelMaximized" class="panel-resize-handle panel-resize-handle--left" @pointerdown="startAiPanelResize" />
-            <div class="h-full min-h-0 overflow-hidden rounded-[inherit]">
+            <div class="h-full min-h-0 overflow-hidden rounded-[inherit]" @mousedown="rememberAuxiliarySearchSurface('ai')">
               <AiAssistant
                 v-if="aiPanelReady"
                 ref="aiAssistantRef"
@@ -3951,8 +4075,10 @@ onUnmounted(() => {
             :style="{ width: historyWidth + 'px' }"
           >
             <div class="panel-resize-handle panel-resize-handle--left" @pointerdown="startHistoryResize" />
-            <div class="h-full min-h-0 overflow-hidden rounded-[inherit]">
-              <QueryHistory :current-connection-id="activeTab?.connectionId" :current-database="activeTab?.database" @restore="restoreHistorySql" @analyze-ai="analyzeHistoryWithAi" @close="closeRightSidebarPanel('history')" />
+            <div class="h-full min-h-0 overflow-hidden rounded-[inherit]" @mousedown="rememberAuxiliarySearchSurface('history')">
+              <div data-history-panel class="h-full min-h-0">
+                <QueryHistory :current-connection-id="activeTab?.connectionId" :current-database="activeTab?.database" @restore="restoreHistorySql" @analyze-ai="analyzeHistoryWithAi" @close="closeRightSidebarPanel('history')" />
+              </div>
             </div>
           </div>
 
@@ -3963,8 +4089,10 @@ onUnmounted(() => {
             :style="{ width: sqlLibraryWidth + 'px' }"
           >
             <div class="panel-resize-handle panel-resize-handle--left" @pointerdown="startSqlLibraryResize" />
-            <div class="h-full min-h-0 overflow-hidden rounded-[inherit]">
-              <SqlLibraryPanel @close="closeRightSidebarPanel('sqlLibrary')" />
+            <div class="h-full min-h-0 overflow-hidden rounded-[inherit]" @mousedown="rememberAuxiliarySearchSurface('sqlLibrary')">
+              <div data-sql-library-panel class="h-full min-h-0">
+                <SqlLibraryPanel @close="closeRightSidebarPanel('sqlLibrary')" />
+              </div>
             </div>
           </div>
 

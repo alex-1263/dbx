@@ -305,6 +305,7 @@ import { createDataGridRuntimeScope } from "@/lib/dataGrid/dataGridRuntime";
 import { useDataGridEditor } from "@/composables/useDataGridEditor";
 import { useDataGridSort } from "@/composables/useDataGridSort";
 import { useDataGridSearch, type DataGridSearchMatch } from "@/composables/useDataGridSearch";
+import { findDataGridReplacementMatches, replaceDataGridText, type DataGridReplaceScope } from "@/lib/dataGrid/dataGridReplace";
 import { useDataGridResultLifecycle } from "@/composables/useDataGridResultLifecycle";
 import { useDataGridAutoRefresh } from "@/composables/useDataGridAutoRefresh";
 import { useDataGridAsyncSurface } from "@/composables/useDataGridAsyncSurface";
@@ -1012,11 +1013,21 @@ const transposeScrollLeft = ref(0);
 const transposeViewportWidth = ref(0);
 const { sortColumn: sortCol, sortColumnIndex: sortColIndex, sortDirection: sortDir, sortMode, setSort, clearSort } = useDataGridSort();
 const searchBarRef = ref<{ focus: (select?: boolean) => void } | null>(null);
+const replaceOpen = ref(false);
+const replacementText = ref("");
+const replaceScope = ref<DataGridReplaceScope>("loaded");
+const replaceCaseSensitive = ref(false);
+const replaceColumn = ref(-1);
 const dataGridSearch = useDataGridSearch({
   columns: () => props.result.columns,
   suggestionColumns: () => props.tableMeta?.columns.map((column) => column.name) ?? props.result.columns,
   rows: () => displayItems.value,
   getCellSearchText: (row, columnIndex) => (row.data[columnIndex] === null ? "" : rowLowerTextCache.get(row.data, columnIndex)),
+  getCellRawSearchText: (row, columnIndex) => (typeof row.data[columnIndex] === "string" ? (row.data[columnIndex] as string) : replaceOpen.value ? "" : String(row.data[columnIndex] ?? "")),
+  caseSensitive: () => replaceOpen.value && replaceCaseSensitive.value,
+  literalQuery: replaceOpen,
+  includeColumnMatches: () => !replaceOpen.value,
+  isCellSearchable: (row, columnIndex) => !replaceOpen.value || (canReplaceGridCell(row, columnIndex) && replacementCellInScope(row.id, columnIndex)),
   onNavigate: () => nextTick(scrollToCurrentMatch),
   // Same key as useDataGridEditor below: table data tabs use the tab id, query
   // results use resultGridInstanceKey so a re-execute starts with a clean search.
@@ -1315,7 +1326,6 @@ const {
   applyLocalFilter,
   applyTypedLocalFilterValue,
   clearLocalFilter,
-  rowMatchesLocalColumnFilters,
 } = localColumnFilterRuntime;
 
 function guardHeaderPanelDismiss() {
@@ -1707,7 +1717,16 @@ function navigateSuggestion(delta: number) {
   dataGridSearch.navigateSuggestion(delta);
 }
 
-function focusSearch(): boolean {
+function focusSearch(target: Element | null = null): boolean {
+  const tableInfoDrawer = target?.closest<HTMLElement>("[data-table-info-drawer]");
+  if (tableInfoDrawer) {
+    const input = tableInfoDrawer.querySelector<HTMLInputElement>("[data-table-info-search]");
+    if (input) {
+      input.focus();
+      input.select();
+      return true;
+    }
+  }
   searchOverlayVisible.value = true;
   nextTick(() => {
     searchBarRef.value?.focus(true);
@@ -1716,12 +1735,23 @@ function focusSearch(): boolean {
 }
 
 function closeSearch() {
+  replaceOpen.value = false;
   dataGridSearch.close();
 }
 
 const PAIRS: Record<string, string> = { "'": "'", '"': '"', "(": ")" };
 
 function onSearchKeydown(e: KeyboardEvent) {
+  if (replaceOpen.value) {
+    if (isCancelSearchShortcut(e)) {
+      e.preventDefault();
+      closeSearch();
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      navigateMatch(e.shiftKey ? -1 : 1);
+    }
+    return;
+  }
   if (e.key in PAIRS && !e.ctrlKey && !e.metaKey) {
     const input = e.target as HTMLInputElement;
     const start = input.selectionStart ?? 0;
@@ -2176,8 +2206,13 @@ function scrollToColumnIndex(columnIndex: number) {
 
   nextTick(() => {
     const visibleColIdx = visibleColumnIndexes.value.indexOf(columnIndex);
+    if (visibleColIdx < 0) return;
+    if (isTransposeMode.value) {
+      scrollTransposeFieldIntoView(visibleColIdx);
+      return;
+    }
     const scroller = gridRef.value?.querySelector<HTMLElement>(".data-grid-scroller");
-    if (visibleColIdx < 0 || !scroller) return;
+    if (!scroller) return;
 
     const targetLeft = Math.max(0, columnContentOffsetLeft(visibleColIdx) - scroller.clientWidth / 2 + (renderedColumnWidths.value[visibleColIdx] ?? 0) / 2);
     scroller.scrollLeft = targetLeft;
@@ -2921,6 +2956,7 @@ watch([localFilterScopeKey, localFilterRestoreKey], ([, restoreKey], [, previous
 
 // --- Pagination ---
 const pageSizePreference = computed(() => resolveDataGridPageSizePreference(props.context, props.pageSizePreference));
+const defaultPageSize = computed(() => preferredDataGridPageSize(settingsStore.editorSettings, pageSizePreference.value));
 const pageSize = ref(preferredDataGridPageSize(settingsStore.editorSettings, pageSizePreference.value, props.pageLimit));
 const currentPage = ref(1);
 const pageSizeOptions = computed(() => resultPageSizeMenuOptions(pageSize.value));
@@ -3343,13 +3379,21 @@ function checkInfiniteScroll(scroller: HTMLElement) {
 function changePageSize(size: number) {
   const normalizedSize = normalizeResultPageSize(size);
   pageSize.value = normalizedSize;
-  settingsStore.updateEditorSettings(dataGridPageSizeSettingsPatch(pageSizePreference.value, normalizedSize));
   currentPage.value = 1;
   lastInfiniteScrollPage = 0;
   infiniteScrollAllLoaded = false;
   infiniteScrollPositions = new WeakMap();
   resetGridVerticalScroll(true);
   emit("paginate", 0, normalizedSize, currentWhereInput(), currentOrderBy());
+}
+
+function setDefaultPageSize() {
+  settingsStore.updateEditorSettings(dataGridPageSizeSettingsPatch(pageSizePreference.value, pageSize.value));
+}
+
+function applyCustomPageSizeAndSetDefault() {
+  applyCustomPageSize();
+  setDefaultPageSize();
 }
 
 function applyCustomPageSize() {
@@ -3682,6 +3726,7 @@ const {
   commitEditAndMaybeAutoSave,
   commitEditFromBlur,
   applyCellValue,
+  stageCellReplacements,
   restoreCellValue,
   cancelEdit,
   onEditKeydown,
@@ -4345,7 +4390,7 @@ const rollbackToolbarCapability = computed<DataGridToolbarActionCapability>(() =
 const sortedRows = computed(() => {
   let indices = localFilteredRows.value;
   const q = deferredClientSearchText.value;
-  if (q && dataGridSearchMode.value === "filter") {
+  if (q && dataGridSearchMode.value === "filter" && !replaceOpen.value) {
     // Preserve the legacy Ctrl+F behavior when the user chooses row filtering.
     const rows = props.result.rows;
     indices = indices.filter((sourceIndex) => {
@@ -4391,7 +4436,9 @@ const displayRowRefs = computed<DisplayRowRef[]>(() => {
     } else {
       const newIndex = entry.newIndex;
       const row = newRows.value[newIndex];
-      if (!row || !rowMatchesLocalColumnFilters(row)) continue;
+      // Pending rows must remain visible while a column filter is active so
+      // users can fill in and review newly inserted records before saving.
+      if (!row) continue;
       const status: RowStatus = "new";
       if (!matchesRowStatusFilter(status, rowStatusFilter.value)) continue;
       refs.push({
@@ -4647,21 +4694,23 @@ function scrollToCurrentMatch() {
   if (rowEl) rowEl.scrollIntoView({ block: "center" });
 }
 
-// In transpose view records are columns (horizontal) and fields are rows
-// (vertical). Bring the matched record column into the horizontal viewport and
-// the matched field row into the vertical viewport.
+function scrollTransposeFieldIntoView(visibleFieldIndex: number) {
+  const scroller = transposeScrollRef.value;
+  if (scroller && !(scroller instanceof HTMLElement)) {
+    (scroller as { scrollToItem?: (index: number) => void }).scrollToItem?.(visibleFieldIndex);
+  } else if (scroller instanceof HTMLElement) {
+    scroller.scrollTop = visibleFieldIndex * transposeRowHeight.value;
+  }
+}
+
+// Transpose fields are vertical rows, while records are horizontal columns.
 function scrollTransposeMatchIntoView(match: DataGridSearchMatch) {
   nextTick(() => {
-    const scroller = transposeScrollRef.value;
     // Both match kinds use `col` as the field (transpose row) index: cell
     // matches store the field/value index, column-name matches store the field.
     const fieldIndex = match.col;
-    if (scroller && !(scroller instanceof HTMLElement)) {
-      // RecycleScroller component instance exposes scrollToItem via vue-virtual-scroller.
-      (scroller as { scrollToItem?: (index: number) => void }).scrollToItem?.(fieldIndex);
-    } else if (scroller instanceof HTMLElement) {
-      scroller.scrollTop = fieldIndex * 30;
-    }
+    const visibleFieldIndex = visibleColumnIndexes.value.indexOf(fieldIndex);
+    if (visibleFieldIndex >= 0) scrollTransposeFieldIntoView(visibleFieldIndex);
     if (match.kind === "cell") {
       scrollTransposeRecordIntoView(match.displayRow);
     }
@@ -4745,7 +4794,7 @@ const deleteRowDetails = computed(() => {
 });
 
 const hasVisibleRows = computed(() => displayRowCount.value > 0);
-const hasActiveFilter = computed(() => (dataGridSearchMode.value === "filter" && !!deferredClientSearchText.value) || rowStatusFilter.value !== "all" || hasLocalColumnFilters.value || hasServerColumnFilters.value);
+const hasActiveFilter = computed(() => (dataGridSearchMode.value === "filter" && !replaceOpen.value && !!deferredClientSearchText.value) || rowStatusFilter.value !== "all" || hasLocalColumnFilters.value || hasServerColumnFilters.value);
 const emptyTitle = computed(() => (hasActiveFilter.value ? t("grid.noFilteredRows") : t("grid.noRows")));
 const emptyDescription = computed(() => (hasActiveFilter.value ? t("grid.noFilteredRowsDescription") : t("grid.noRowsDescription")));
 watch(
@@ -7439,6 +7488,7 @@ const {
   sql: computed(() => props.sql),
   exportSql: computed(() => props.exportSql),
   tableMeta: computed(() => (props.tableMeta ? { ...props.tableMeta } : undefined)),
+  includeDatabaseName: computed(() => settingsStore.editorSettings.generateSqlIncludeDatabaseName),
   copyInsertTargetLabel: computed(() => props.tableMeta?.tableName ?? props.customSaveHandler?.targetLabel),
   mongoUpdateTarget: computed(() => props.mongoUpdateTarget),
   databaseType: computed(() => props.databaseType),
@@ -8032,6 +8082,84 @@ function selectedRangeTargetsOnlyDraftRow(): boolean {
   return displayItemAt(range.startRow)?.isDraft === true;
 }
 
+const replaceAvailable = computed(() => !!props.editable && hasDataGridSaveTarget.value && canEditExistingRows.value && !resolvedConnectionConfig.value?.read_only && !isConditionalUpdateActive.value);
+const replaceBusy = computed(() => isSaving.value || gridSurfaceBusy.value || props.loading === true);
+
+function replacementRowItem(rowId: number): RowItem | undefined {
+  const row = props.result.rows[rowId];
+  if (!row || rowId < 0) return undefined;
+  return { id: rowId, displayIndex: displayRowIndexById(rowId), sourceIndex: rowId, data: rowDataWithChanges(row, rowId), isNew: false, isDeleted: deletedRows.value.has(rowId), isDirtyCol: [], status: dirtyRows.value.has(rowId) ? "edited" : "clean" };
+}
+
+function canReplaceGridCell(item: RowItem | undefined, col: number): boolean {
+  const type = allColumnTypes.value[col];
+  return (
+    replaceAvailable.value &&
+    !!item &&
+    item.sourceIndex !== undefined &&
+    !item.isNew &&
+    !item.isDraft &&
+    typeof item.data[col] === "string" &&
+    canEditCellItem(item, col) &&
+    !isLargeValuePreview(item, col) &&
+    !isBinaryCellColumnType(type) &&
+    !isNumericColumnType(type) &&
+    !isBooleanGridCell(item, col)
+  );
+}
+
+function replacementCellInScope(rowId: number, col: number): boolean {
+  if (replaceScope.value === "loaded") return true;
+  if (replaceScope.value === "column") return col === replaceColumn.value;
+  const rowIndex = displayRowIndexById(rowId);
+  const visibleCol = visibleColumnIndexes.value.indexOf(col);
+  return rowIndex >= 0 && visibleCol >= 0 && (cellIsSelected(rowIndex, visibleCol) || isRowSelected(rowId) || columnIsSelected(visibleCol));
+}
+
+const replacementMatches = computed(() => {
+  if (!replaceOpen.value || !replaceAvailable.value) return [];
+  const items = new Map(props.result.rows.map((_, rowId) => [rowId, replacementRowItem(rowId)!]));
+  return findDataGridReplacementMatches({
+    rows: [...items.values()].map((item) => ({ rowId: item.id, data: item.data })),
+    search: deferredClientSearchText.value,
+    caseSensitive: replaceCaseSensitive.value,
+    includesCell: replacementCellInScope,
+    canReplaceCell: (rowId, col) => canReplaceGridCell(items.get(rowId), col),
+  });
+});
+
+const canReplaceCurrent = computed(() => {
+  if (searchText.value !== deferredClientSearchText.value) return false;
+  const match = currentSearchMatch.value;
+  if (!match || match.kind !== "cell") return false;
+  const item = displayItemAt(match.displayRow);
+  return !!item && replacementMatches.value.some((candidate) => candidate.rowId === item.id && candidate.col === match.col);
+});
+
+watch([replaceOpen, replaceScope], () => {
+  if (!replaceOpen.value || replaceScope.value !== "column") return;
+  const selectionCol = selectionFocus.value?.colIndex ?? [...selectedColumnIndexes.value][0];
+  replaceColumn.value = selectionCol !== null && selectionCol !== undefined ? actualColumnIndex(selectionCol) : (currentSearchMatch.value?.col ?? visibleColumnIndexes.value[0] ?? -1);
+});
+
+watch(
+  () => props.result,
+  () => {
+    replaceOpen.value = false;
+    replaceColumn.value = -1;
+  },
+);
+
+function replaceGridMatches(currentOnly = false) {
+  if (!replaceAvailable.value || replaceBusy.value) return;
+  if (currentOnly && !canReplaceCurrent.value) return;
+  const current = currentSearchMatch.value;
+  const currentRowId = current?.kind === "cell" ? displayItemAt(current.displayRow)?.id : undefined;
+  const matches = replacementMatches.value.filter((match) => !currentOnly || (match.rowId === currentRowId && match.col === current?.col));
+  const count = stageCellReplacements(matches.map((match) => ({ ...match, previousValue: match.value, value: replaceDataGridText(match.value, deferredClientSearchText.value, replacementText.value, replaceCaseSensitive.value) })));
+  if (count > 0) toast(t("grid.replaceStagedCells", { count }), 5000);
+}
+
 function fillSelectionWithValue(value: string | null, options: { preserveEmptyString?: boolean; emptyStringAsNull?: boolean } = {}): boolean {
   const range = selectedRange.value;
   let applied = false;
@@ -8430,12 +8558,7 @@ const DOM_DATA_GRID_ROW_HEIGHT = 26;
 function scrollCellIntoView(rowIndex: number, colIndex: number, block: DataGridScrollAlignment = "nearest", previousPageRowIndex?: number) {
   if (isTransposeMode.value) {
     nextTick(() => {
-      const scroller = transposeScrollRef.value;
-      if (scroller && !(scroller instanceof HTMLElement)) {
-        (scroller as { scrollToItem?: (index: number) => void }).scrollToItem?.(colIndex);
-      } else if (scroller instanceof HTMLElement) {
-        scroller.scrollTop = colIndex * 30;
-      }
+      scrollTransposeFieldIntoView(colIndex);
       scrollTransposeRecordIntoView(rowIndex);
     });
     return;
@@ -8843,7 +8966,7 @@ async function onGridKeydown(event: KeyboardEvent) {
   if (!targetAllowsNativeClipboard && handleGridPaginationShortcut(event)) return;
   if (isFocusSearchShortcut(event) && !isGoToColumnShortcut(event, settingsStore.editorSettings.shortcuts)) {
     event.preventDefault();
-    focusSearch();
+    focusSearch(event.target instanceof Element ? event.target : document.activeElement instanceof Element ? document.activeElement : null);
     return;
   }
   if (isModRShortcut(event)) {
@@ -11820,6 +11943,16 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
             <DataGridSearchBar
               ref="searchBarRef"
               v-model:text="searchText"
+              v-model:replace-open="replaceOpen"
+              v-model:replacement-text="replacementText"
+              v-model:replace-scope="replaceScope"
+              v-model:case-sensitive="replaceCaseSensitive"
+              v-model:replace-column="replaceColumn"
+              :replace-available="replaceAvailable"
+              :replace-busy="replaceBusy"
+              :replace-match-count="replacementMatches.length"
+              :can-replace-current="canReplaceCurrent"
+              :columns="props.result.columns"
               :open="searchOverlayVisible"
               :suggestions="searchSuggestions"
               :suggestion-index="suggestionIndex"
@@ -11829,6 +11962,8 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
               :values-truncated="(props.result.large_value_cells?.length ?? 0) > 0"
               @keydown="onSearchKeydown"
               @navigate="navigateMatch"
+              @replace-current="replaceGridMatches(true)"
+              @replace-all="replaceGridMatches()"
               @close="closeSearch"
               @accept-suggestion="
                 suggestionIndex = $event;
@@ -11917,6 +12052,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                         data-native-clipboard
                         class="sticky left-0 z-10 flex shrink-0 flex-col items-start justify-center overflow-hidden border-r border-border bg-background px-3 py-0"
                         :class="{
+                          'ring-2 ring-inset ring-primary': highlightedColumnIndex === visibleColumnIndexes[index],
                           'bg-yellow-200/60 dark:bg-yellow-500/20': transposeHeaderIsSearchMatch(visibleColumnIndexes[index]),
                           'ring-2 ring-inset ring-yellow-500 bg-yellow-300/60 dark:bg-yellow-500/40': transposeHeaderIsCurrentMatch(visibleColumnIndexes[index]),
                         }"
@@ -13076,6 +13212,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
           <div
             v-if="showTableInfo"
             data-native-clipboard
+            data-table-info-drawer
             class="table-info-drawer relative col-start-2 row-start-1 border-l flex flex-col bg-background min-w-0 max-w-full"
             :class="[{ 'row-span-2': cellDetailPanelIsBottom }, { 'ddl-drawer-resizing': isResizingDdl }]"
             :style="ddlDrawerStyle"
@@ -13148,7 +13285,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
               <div class="flex min-w-0 items-center gap-1">
                 <div class="relative min-w-0 flex-1">
                   <Search class="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
-                  <input v-model="searchQuery" :placeholder="t('grid.tableInfoSearch')" class="w-full h-7 pl-7 pr-6 text-xs bg-muted/50 rounded border border-border focus:outline-none focus:border-primary/50" @keydown="onTableInfoSearchKeydown" />
+                  <input v-model="searchQuery" data-table-info-search :placeholder="t('grid.tableInfoSearch')" class="w-full h-7 pl-7 pr-6 text-xs bg-muted/50 rounded border border-border focus:outline-none focus:border-primary/50" @keydown="onTableInfoSearchKeydown" />
                   <button v-if="searchQuery" type="button" class="absolute right-1.5 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground" @click="searchQuery = ''">
                     <X class="w-3 h-3" />
                   </button>
@@ -13421,6 +13558,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
         :infinite-scroll-enabled="infiniteScrollEnabled"
         :infinite-scroll-all-loaded="infiniteScrollAllLoaded"
         :page-size="pageSize"
+        :default-page-size="defaultPageSize"
         :page-size-menu-items="pageSizeMenuItems"
         :export-menu-items="exportMenuItems"
         :current-page="currentPage"
@@ -13429,6 +13567,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
         :can-jump-last-page="canJumpLastPage"
         @select-page-size="selectPageSizeMenuItem"
         @apply-custom-page-size="applyCustomPageSize"
+        @apply-custom-page-size-and-set-default="applyCustomPageSizeAndSetDefault"
         @first-page="firstPage"
         @previous-page="prevPage"
         @next-page="nextPage"

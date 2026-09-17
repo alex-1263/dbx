@@ -162,6 +162,7 @@ import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { decorateDatabaseSavedSqlTreeNodes, indexSavedSqlFilesByDatabase, stripDatabaseSavedSqlTreeNodes, withDatabaseSavedSqlRoot } from "@/lib/savedSql/savedSqlDatabaseTree";
 import { encodeSqlServerLinkedSchema, parseSqlServerLinkedSchema } from "@/lib/database/sqlServerLinkedServers";
 import { inferMongoCompletionFields, type MongoCompletionField } from "@/lib/mongo/mongoCompletion";
+import { flattenElasticsearchMappingFields, type ElasticsearchCompletionField } from "@/lib/elasticsearch/elasticsearchCompletion";
 import { isMongoLegacyDriverProfile } from "@/lib/mongo/mongoCapabilities";
 import { mongoCollectionKindFromNode, toMongoCollectionKind, visibleMongoCollections } from "@/lib/sidebar/mongoCollectionMutation";
 import { completionSchemasFromTree, completionTablesFromTree } from "@/lib/metadata/completionTreeIndex";
@@ -510,6 +511,7 @@ export const useConnectionStore = defineStore("connection", () => {
   const primaryVisibleObjectNames = ref<Record<string, string[]>>({});
   const sqlServerCompletionContextCache = ref<Record<string, SqlServerCompletionContext>>({});
   const elasticsearchCompletionIndicesCache = ref<Record<string, string[]>>({});
+  const elasticsearchCompletionFieldsCache = ref<Record<string, ElasticsearchCompletionField[]>>({});
   const redisCompletionKeysCache = ref<Record<string, string[]>>({});
   const redisCommandDocsCache = ref<Record<string, RedisCommandDocumentation[]>>({});
   const redisCommandDocsCacheGeneration = new Map<string, number>();
@@ -583,6 +585,7 @@ export const useConnectionStore = defineStore("connection", () => {
     schema?: string;
     tableName?: string;
   } | null>(null);
+  const mongoDatabaseDumpSource = ref<{ connectionId: string; database: string; mode: "dump" | "restore" } | null>(null);
   const mongoImportSource = ref<{
     connectionId: string;
     database: string;
@@ -3542,6 +3545,9 @@ export const useConnectionStore = defineStore("connection", () => {
     }
     for (const key of Object.keys(elasticsearchCompletionIndicesCache.value)) {
       if (key === exactCacheKey || key.startsWith(cachePrefix)) delete elasticsearchCompletionIndicesCache.value[key];
+    }
+    for (const key of Object.keys(elasticsearchCompletionFieldsCache.value)) {
+      if (key === exactCacheKey || key.startsWith(cachePrefix)) delete elasticsearchCompletionFieldsCache.value[key];
     }
     for (const key of Object.keys(redisCompletionKeysCache.value)) {
       if (key === exactCacheKey || key.startsWith(cachePrefix)) delete redisCompletionKeysCache.value[key];
@@ -8032,6 +8038,21 @@ export const useConnectionStore = defineStore("connection", () => {
     return elasticsearchCompletionIndicesCache.value[cacheKey];
   }
 
+  async function listElasticsearchCompletionFields(connectionId: string, index: string): Promise<ElasticsearchCompletionField[]> {
+    if (!index) return [];
+    const cacheKey = `${connectionId}:${index}`;
+    const cached = elasticsearchCompletionFieldsCache.value[cacheKey];
+    if (cached) return cached;
+    return withCompletionInFlight(`${cacheKey}:es-fields`, async () => {
+      await ensureConnected(connectionId);
+      const mapping = await api.elasticsearchGetIndexMetadata(connectionId, index, "mapping");
+      const fields = flattenElasticsearchMappingFields(mapping);
+      elasticsearchCompletionFieldsCache.value[cacheKey] = fields;
+      evictOldestCacheEntries(elasticsearchCompletionFieldsCache.value, COMPLETION_CACHE_MAX);
+      return fields;
+    });
+  }
+
   // Upper bound on cached key names per db, to keep completion memory bounded
   // (Redis can hold far more keys than we ever want resident for autocomplete).
   const REDIS_COMPLETION_KEYS_MAX = 1000;
@@ -9514,6 +9535,7 @@ export const useConnectionStore = defineStore("connection", () => {
     refreshCompletionSchemas,
     refreshCompletionDatabases,
     listElasticsearchCompletionIndices,
+    listElasticsearchCompletionFields,
     listRedisCompletionKeys,
     listRedisCompletionCommandDocs,
     listMongoCompletionCollections,
@@ -9536,6 +9558,7 @@ export const useConnectionStore = defineStore("connection", () => {
     diagramSource,
     docsSource,
     tableImportSource,
+    mongoDatabaseDumpSource,
     mongoImportSource,
     mongoImportCompleted,
     tableDataGenerateSource,
