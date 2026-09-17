@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { TreeNode } from "@/types/database";
 import {
   applyTableVGroupsToChildren,
+  collectTableTreeNames,
   createTableVGroup,
   deleteTableVGroups,
   emptyTableVGroupLayout,
+  hasTableTreeLoadMore,
   moveTableToVGroup,
   normalizeTableVGroupLayout,
   pruneTableVGroupMembers,
@@ -191,6 +193,26 @@ describe("resolveTableVGroupScopeFromNode", () => {
   it("derives a table row's scope from the host container, not the display group", () => {
     expect(resolveTableVGroupScopeFromNode([databaseNode], row)).toEqual(resolveTableVGroupScopeFromNode([databaseNode], databaseNode));
   });
+
+  it("derives a projected group row's scope from the host container", () => {
+    const groupRow: TreeNode = { id: "table-vgroup:g1", label: "回归组", type: "table-vgroup", vgroupId: "g1", connectionId: "conn-1", database: "main", schema: "main", children: [] };
+    tablesGroup.children = [row, groupRow];
+    expect(resolveTableVGroupScopeFromNode([databaseNode], groupRow)).toEqual(resolveTableVGroupScopeFromNode([databaseNode], databaseNode));
+  });
+});
+
+describe("table tree helpers", () => {
+  it("detects pagination cursors nested under table nodes", () => {
+    const stable: TreeNode = { id: "stable", label: "st", type: "stable", children: [{ id: "lm", label: "more", type: "load-more" }] };
+    expect(hasTableTreeLoadMore([stable])).toBe(true);
+    expect(hasTableTreeLoadMore([tableNode("t_order")])).toBe(false);
+  });
+
+  it("collects table names from nested children", () => {
+    const stable: TreeNode = { id: "stable", label: "st", type: "stable", children: [tableNode("t_child")] };
+    const names = collectTableTreeNames([tableNode("t_order"), stable]);
+    expect([...names].sort()).toEqual(["t_child", "t_order"]);
+  });
 });
 
 describe("normalizeTableVGroupLayout", () => {
@@ -211,6 +233,27 @@ describe("normalizeTableVGroupLayout", () => {
   it("returns an empty current-version layout for malformed payloads", () => {
     expect(normalizeTableVGroupLayout(null)).toEqual(emptyTableVGroupLayout());
     expect(normalizeTableVGroupLayout({ groups: "nope" })).toEqual(emptyTableVGroupLayout());
+  });
+
+  it("deduplicates repeated table names and group references within a level", () => {
+    const created = createTableVGroup(emptyTableVGroupLayout(), "订单域");
+    const layout = moveTableToVGroup(created.layout, "t_order", created.groupId);
+    const withDuplicates = {
+      ...layout,
+      order: [
+        {
+          type: "group",
+          id: created.groupId,
+          children: [
+            { type: "table", name: "t_order" },
+            { type: "table", name: "t_order" },
+          ],
+        },
+        { type: "group", id: created.groupId, children: [] },
+      ],
+    };
+    const normalized = normalizeTableVGroupLayout(withDuplicates);
+    expect(normalized.order).toEqual([{ type: "group", id: created.groupId, children: [{ type: "table", name: "t_order" }] }]);
   });
 });
 

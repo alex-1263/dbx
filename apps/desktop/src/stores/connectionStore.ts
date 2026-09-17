@@ -66,12 +66,14 @@ import {
   type ReorderEntriesOptions,
 } from "@/lib/sidebar/sidebarLayout";
 import {
-  hasTableVGroupEntries,
   applyTableVGroupsToChildren,
+  collectTableTreeNames,
   createTableVGroup as createTableVGroupOp,
   deleteTableVGroups as deleteTableVGroupsOp,
   emptyTableVGroupLayout,
   findTableVGroupContainerNode,
+  hasTableTreeLoadMore,
+  hasTableVGroupEntries,
   moveTableToVGroup as moveTableToVGroupOp,
   normalizeTableVGroupLayout as normalizeTableVGroupLayoutOp,
   pruneTableVGroupMembers as pruneTableVGroupMembersOp,
@@ -8747,12 +8749,8 @@ export const useConnectionStore = defineStore("connection", () => {
     const resolved = resolveTableVGroupScope(parent);
     const layout = resolved ? tableVGroupLayouts.value[resolved.scopeKey] : undefined;
     if (!resolved || !hasTableVGroupEntries(layout)) return;
-    if (children.some((child) => child.type === "load-more")) return;
-    const keepNames = new Set(
-      stripTableVGroupsFromChildren(children)
-        .filter((node) => node.type === "table")
-        .map((node) => node.label),
-    );
+    if (hasTableTreeLoadMore(children)) return;
+    const keepNames = collectTableTreeNames(stripTableVGroupsFromChildren(children));
     const next = pruneTableVGroupMembersOp(layout, keepNames);
     if (next === layout) return;
     updateTableVGroupLayout(resolved.scope, resolved.scopeKey, next);

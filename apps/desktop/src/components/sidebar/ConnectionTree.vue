@@ -1662,6 +1662,14 @@ async function locateTabInSidebar(tab: QueryTab | undefined | null, align: Sideb
     }
   }
 
+  // 表分组行同样是投影出的合成节点（不登记已加载子节点，上面的守卫会跳过），
+  // 折叠状态存在布局里，必须经布局 op 展开，否则下次投影又把它折叠回去。
+  for (const node of nodePath) {
+    if (node.type !== "table-vgroup" || !node.vgroupId) continue;
+    const group = store.tableVGroupLayoutFor(node)?.groups.find((current) => current.id === node.vgroupId);
+    if (group?.collapsed) store.toggleTableVGroupCollapsed(node, node.vgroupId);
+  }
+
   // Connection groups never register loaded tree children, so the guard above
   // skips them and a collapsed group keeps the target out of the visible flat
   // tree. Reopen them through the layout op so the expansion is persisted and

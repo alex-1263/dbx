@@ -72,9 +72,9 @@ import { beginTableReferenceDragFeedback, isOverSqlEditorTarget, type TableRefer
 import { formatSidebarObjectStorage } from "@/lib/sidebar/sidebarDatabaseStorage";
 import { dataTabOpenModeFromTreeClick } from "@/lib/sidebar/dataTabOpenPolicy";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
-import { tableVGroupIdFromNodeId } from "@/lib/table/tableVGroup";
+import { selectedTableVGroupMoveTargets, tableVGroupIdFromNodeId } from "@/lib/table/tableVGroup";
+import { findTreeNodeById } from "@/lib/sql/newQueryContext";
 import { resolveTableVGroupDropTarget, setTableVGroupDropTargetNodeId, tableVGroupDropTargetNodeId } from "@/lib/sidebar/sidebarTableVGroupDrag";
-import { selectedTableVGroupMoveTargets } from "@/lib/table/tableVGroup";
 import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentation";
 import { encodeSpannerResourcePath } from "@/lib/connection/spannerResourcePath";
 import { hexToRgba } from "@/lib/common/color";
@@ -1189,9 +1189,15 @@ const {
   if (dragState.draggedType === "table-vgroup") {
     const draggedGroupId = tableVGroupIdFromNodeId(draggedId);
     const targetGroupId = tableVGroupIdFromNodeId(targetId);
-    if (draggedGroupId && targetGroupId) connectionStore.reorderTableVGroupEntry(activeNode.value, draggedGroupId, targetGroupId, position);
+    // 落点回调是模块级单例，activeNode 未必是同容器的落点行，须用 targetId 现查。
+    const targetNode = findTreeNodeById(connectionStore.treeNodes, targetId);
+    if (draggedGroupId && targetGroupId && targetNode) connectionStore.reorderTableVGroupEntry(targetNode, draggedGroupId, targetGroupId, position);
     return;
   }
+
+  // 分组行只在拖动分组自身时才是合法落点：否则 targetId 不在侧边栏布局里，
+  // reorderSidebarEntries 找不到目标会把连接追加到根列表末尾。
+  if (tableVGroupIdFromNodeId(targetId)) return;
 
   // If the grabbed row is part of a multi-selection, move all selected rows
   // together; otherwise just the grabbed one (issue #681).

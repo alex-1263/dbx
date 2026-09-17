@@ -482,13 +482,19 @@ export function normalizeTableVGroupLayout(value: unknown): TableVGroupLayout {
   const normalizeEntries = (entries: unknown): TableVGroupOrderEntry[] => {
     const out: TableVGroupOrderEntry[] = [];
     if (!Array.isArray(entries)) return out;
+    // 同一层里重复的表名或分组引用会投影出重复节点（渲染以 id 作 key），
+    // 损坏的持久化数据必须在归一化这一步收敛。
+    const seenTableNames = new Set<string>();
+    const seenGroupEntries = new Set<string>();
     for (const entry of entries) {
       if (!entry || typeof entry !== "object") continue;
       const candidate = entry as Partial<TableVGroupOrderEntry>;
       if (candidate.type === "table") {
-        if (typeof candidate.name !== "string" || !candidate.name) continue;
+        if (typeof candidate.name !== "string" || !candidate.name || seenTableNames.has(candidate.name)) continue;
+        seenTableNames.add(candidate.name);
         out.push({ type: "table", name: candidate.name });
-      } else if (candidate.type === "group" && typeof candidate.id === "string" && candidate.id && validGroupIds.has(candidate.id)) {
+      } else if (candidate.type === "group" && typeof candidate.id === "string" && candidate.id && validGroupIds.has(candidate.id) && !seenGroupEntries.has(candidate.id)) {
+        seenGroupEntries.add(candidate.id);
         out.push({ type: "group", id: candidate.id, children: normalizeEntries(entryChildren(candidate as TableVGroupEntry)) });
       }
     }
@@ -504,19 +510,23 @@ export function normalizeTableVGroupLayout(value: unknown): TableVGroupLayout {
   };
 }
 
+function isTableVGroupDisplayNode(type: TreeNode["type"] | undefined): boolean {
+  return type === "table-vgroup" || (typeof type === "string" && type.startsWith("group-"));
+}
+
 /**
- * 对象分组节点（group-tables / group-views…）是宿主容器下的显示层节点，其
- * database/schema 字段按查询语义填充（sqlite 把 main 同时填进 schema），直接取用
- * 会让 grouped 与 simple 两种显示模式解析出不同 scope_key、把同一批表的分组劈成两份。
- * 因此分组身份一律上溯到 database/schema 一类宿主容器。
+ * 对象分组节点（group-tables / group-views…）与投影出的分组行都是宿主容器下的
+ * 显示层节点，其 database/schema 字段按查询语义填充（sqlite 把 main 同时填进
+ * schema），直接取用会让不同显示模式与不同入口解析出不同 scope_key、把同一批表
+ * 的分组劈成两份。因此分组身份一律上溯到 database/schema 一类宿主容器。
  */
 function findTableVGroupHostContainer(nodes: TreeNode[], node: TreeNode): TreeNode | null {
   const walk = (list: TreeNode[], ancestors: TreeNode[]): TreeNode | null => {
     for (const item of list) {
-      if (item.id === node.id) {
+      if (item === node || item.id === node.id) {
         for (let i = ancestors.length - 1; i >= 0; i--) {
           const ancestor = ancestors[i]!;
-          if (isTableVGroupContainerNode(ancestor)) return ancestor;
+          if (isTableVGroupContainerNode(ancestor) && !isTableVGroupDisplayNode(ancestor.type)) return ancestor;
         }
         return null;
       }
@@ -531,8 +541,7 @@ function findTableVGroupHostContainer(nodes: TreeNode[], node: TreeNode): TreeNo
 }
 
 function tableVGroupScopeHostOf(nodes: TreeNode[], node: TreeNode): TreeNode {
-  const isDisplayGroup = typeof node.type === "string" && node.type.startsWith("group-");
-  return isDisplayGroup ? (findTableVGroupHostContainer(nodes, node) ?? node) : node;
+  return isTableVGroupDisplayNode(node.type) ? (findTableVGroupHostContainer(nodes, node) ?? node) : node;
 }
 
 /**
@@ -547,6 +556,27 @@ export function resolveTableVGroupScopeFromNode(nodes: TreeNode[], node: TreeNod
   if (isTableVGroupContainerNode(row as TreeNode)) return tableVGroupScopeFieldsOf(row as TreeNode);
   const container = findTableVGroupContainerNode(nodes, row as TreeNode, row.type === "table" ? row.label : undefined);
   return tableVGroupScopeFieldsOf(container ? tableVGroupScopeHostOf(nodes, container) : (row as TreeNode));
+}
+
+/**
+ * 任意深度出现分页游标都说明列表不完整：TDengine 等把末页游标嵌在 STABLE 的子表
+ * 分区节点下，只看顶层会把部分页当成全量，进而误删分组成员。
+ */
+export function hasTableTreeLoadMore(nodes: readonly TreeNode[]): boolean {
+  return nodes.some((node) => node.type === "load-more" || (node.children ? hasTableTreeLoadMore(node.children) : false));
+}
+
+/** 收集子树里的表行名；多收只会让回收更保守，不会误删成员。 */
+export function collectTableTreeNames(nodes: readonly TreeNode[]): Set<string> {
+  const names = new Set<string>();
+  const walk = (list: readonly TreeNode[]) => {
+    for (const node of list) {
+      if (node.type === "table" && node.label) names.add(node.label);
+      if (node.children) walk(node.children);
+    }
+  };
+  walk(nodes);
+  return names;
 }
 
 /**
