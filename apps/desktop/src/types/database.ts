@@ -1360,6 +1360,7 @@ export interface SidebarLayout {
 export type TableVGroupOrderEntry = { type: "group"; id: string; children?: TableVGroupOrderEntry[] } | { type: "table"; name: string };
 
 export interface TableVGroupLayout {
+  version?: number;
   groups: ConnectionGroup[];
   order: TableVGroupOrderEntry[];
   /** Toggled by the container context menu to hide groups without deleting them. */

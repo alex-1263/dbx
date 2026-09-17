@@ -1094,6 +1094,10 @@ async fn main() {
             "/layout/table-vgroups",
             post(routes::layout::save_table_vgroups).get(routes::layout::load_table_vgroups),
         )
+        .route(
+            "/layout/table-vgroups/connection/{connection_id}",
+            delete(routes::layout::delete_table_vgroups_for_connection),
+        )
         // App settings
         .route(
             "/app-settings/pinned-tree-node-ids",

@@ -74,6 +74,7 @@ import { dataTabOpenModeFromTreeClick } from "@/lib/sidebar/dataTabOpenPolicy";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { tableVGroupIdFromNodeId } from "@/lib/table/tableVGroup";
 import { resolveTableVGroupDropTarget, setTableVGroupDropTargetNodeId, tableVGroupDropTargetNodeId } from "@/lib/sidebar/sidebarTableVGroupDrag";
+import { selectedTableVGroupMoveTargets } from "@/lib/table/tableVGroup";
 import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentation";
 import { encodeSpannerResourcePath } from "@/lib/connection/spannerResourcePath";
 import { hexToRgba } from "@/lib/common/color";
@@ -1345,6 +1346,10 @@ function tableReferenceDragPayload(): QueryEditorTableReferencePayload | null {
 
 function startTableReferenceDrag(payload: QueryEditorTableReferencePayload) {
   draggingTableReferencePayload = payload;
+  // 分组成员名单只收真实表：视图/物化视图投影不识别，入组会产生隐形脏数据。
+  vgroupDragTableNames = selectedTableVGroupMoveTargets(activeNode.value, selectedTreeNodesInVisibleOrder())
+    .filter((node) => node.type === "table")
+    .map((node) => node.label);
   setActiveTableReferencePayload(payload);
   document.getSelection()?.removeAllRanges();
   referenceDragFeedback = beginTableReferenceDragFeedback(tableReferenceDragLabel(payload));
@@ -1354,6 +1359,7 @@ function finishTableReferenceDrag() {
   clearActiveTableReferencePayload(draggingTableReferencePayload);
   pendingTableReferenceDrag = null;
   draggingTableReferencePayload = null;
+  vgroupDragTableNames = [];
   setTableVGroupDropTargetNodeId(null);
   referenceDragFeedback?.end();
   referenceDragFeedback = null;
@@ -1362,14 +1368,11 @@ function finishTableReferenceDrag() {
   document.removeEventListener("mouseup", onTableReferenceMouseUp, true);
 }
 
-/** Table names carried by a drag payload; database/column payloads have none. */
-function tableReferenceDragTableNames(payload: QueryEditorTableReferencePayload): string[] {
-  if (payload.tableReferences?.length) return payload.tableReferences.map((entry) => entry.tableName);
-  return payload.tableName ? [payload.tableName] : [];
-}
+/** 本次拖拽要移动进分组的表名（拖拽开始时按选中区解析，见 startTableReferenceDrag）。 */
+let vgroupDragTableNames: string[] = [];
 
 function tableVGroupDropTargetFor(payload: QueryEditorTableReferencePayload, event: MouseEvent) {
-  if (!tableReferenceDragTableNames(payload).length) return null;
+  if (!vgroupDragTableNames.length) return null;
   return resolveTableVGroupDropTarget(event.clientX, event.clientY, connectionStore.treeNodes, payload);
 }
 
@@ -1399,7 +1402,7 @@ function onTableReferenceMouseUp(event: MouseEvent) {
     suppressNextTableReferenceClick = true;
     const dropTarget = tableVGroupDropTargetFor(payload, event);
     if (dropTarget) {
-      for (const tableName of tableReferenceDragTableNames(payload)) connectionStore.moveTableToVGroup(dropTarget.node, tableName, dropTarget.groupId);
+      for (const tableName of vgroupDragTableNames) connectionStore.moveTableToVGroup(dropTarget.node, tableName, dropTarget.groupId);
     } else {
       const target = document.elementFromPoint(event.clientX, event.clientY);
       if (target instanceof Element && target.closest(`[data-query-editor-root], ${AI_ASSISTANT_TABLE_DROP_ROOT_SELECTOR}`)) {

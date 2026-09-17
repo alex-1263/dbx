@@ -2620,6 +2620,10 @@ export async function loadTableVGroups(): Promise<Record<string, import("@/types
   return invoke("load_table_vgroups");
 }
 
+export async function deleteTableVGroupsForConnection(connectionId: string): Promise<void> {
+  return invoke("delete_table_vgroups_for_connection", { connectionId });
+}
+
 // --- Updates ---
 export interface UpdateInfo {
   current_version: string;

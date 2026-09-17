@@ -6,7 +6,10 @@ import {
   deleteTableVGroups,
   emptyTableVGroupLayout,
   moveTableToVGroup,
+  normalizeTableVGroupLayout,
+  pruneTableVGroupMembers,
   reorderTableVGroupEntry,
+  resolveTableVGroupScopeFromNode,
   selectedTableVGroupMoveTargets,
   stripTableVGroupsFromChildren,
   tableVGroupDestinationRows,
@@ -112,6 +115,15 @@ describe("tableVGroup layout ops", () => {
 });
 
 describe("applyTableVGroupsToChildren", () => {
+  it("re-applying to already projected children does not duplicate group containers", () => {
+    const created = createTableVGroup(emptyTableVGroupLayout(), "订单域");
+    const layout = moveTableToVGroup(created.layout, "t_order", created.groupId);
+    const first = applyTableVGroupsToChildren([tableNode("t_order"), tableNode("t_other")], layout, SCOPE);
+    const second = applyTableVGroupsToChildren(first, layout, SCOPE);
+    expect(groupIds(second)).toEqual(groupIds(first));
+    expect(second.filter((node) => node.type === "table").map((node) => node.label)).toEqual(["t_other"]);
+  });
+
   it("projects groups at the top of the container and keeps other rows in place", () => {
     const created = createTableVGroup(emptyTableVGroupLayout(), "订单域");
     let layout = moveTableToVGroup(created.layout, "t_order", created.groupId);
@@ -158,6 +170,61 @@ describe("applyTableVGroupsToChildren", () => {
     const stripped = stripTableVGroupsFromChildren(projected);
     expect(stripped.map((node) => node.label)).toEqual(["t_order"]);
     expect(stripped[0]).toBe(tOrder);
+  });
+});
+
+describe("resolveTableVGroupScopeFromNode", () => {
+  const databaseNode: TreeNode = { id: "conn-1:main", label: "main", type: "database", connectionId: "conn-1", database: "main" };
+  const tablesGroup: TreeNode = { id: "conn-1:main:__tables", label: "Tables", type: "group-tables", connectionId: "conn-1", database: "main", schema: "main", children: [] };
+  const row: TreeNode = { ...tableNode("t_order"), database: "main", schema: "main" };
+  databaseNode.children = [tablesGroup];
+  tablesGroup.children = [row];
+
+  it("derives the same scope for a display group and its host container", () => {
+    const fromGroup = resolveTableVGroupScopeFromNode([databaseNode], tablesGroup);
+    const fromHost = resolveTableVGroupScopeFromNode([databaseNode], databaseNode);
+    expect(fromGroup).toEqual(fromHost);
+    // sqlite 语义下分组节点的 schema 填的是 effectiveSchema，不能泄漏进 scope。
+    expect(fromGroup.schema).toBeUndefined();
+  });
+
+  it("derives a table row's scope from the host container, not the display group", () => {
+    expect(resolveTableVGroupScopeFromNode([databaseNode], row)).toEqual(resolveTableVGroupScopeFromNode([databaseNode], databaseNode));
+  });
+});
+
+describe("normalizeTableVGroupLayout", () => {
+  it("keeps valid layouts at the current version and drops unknown fields", () => {
+    const created = createTableVGroup(emptyTableVGroupLayout(), "订单域");
+    const moved = moveTableToVGroup(created.layout, "t_order", created.groupId);
+    const poisoned = JSON.parse(JSON.stringify(moved)) as Record<string, unknown> & { mode?: string; version?: number };
+    poisoned.mode = "exclusive";
+    poisoned.version = 99;
+
+    const normalized = normalizeTableVGroupLayout(poisoned);
+    expect(normalized.version).toBe(1);
+    expect(normalized).not.toHaveProperty("mode");
+    expect(normalized.order).toEqual(moved.order);
+    expect(normalized.groups).toEqual(moved.groups);
+  });
+
+  it("returns an empty current-version layout for malformed payloads", () => {
+    expect(normalizeTableVGroupLayout(null)).toEqual(emptyTableVGroupLayout());
+    expect(normalizeTableVGroupLayout({ groups: "nope" })).toEqual(emptyTableVGroupLayout());
+  });
+});
+
+describe("pruneTableVGroupMembers", () => {
+  it("drops members missing from a complete load but keeps the group itself", () => {
+    const created = createTableVGroup(emptyTableVGroupLayout(), "订单域");
+    let layout = moveTableToVGroup(created.layout, "t_order", created.groupId);
+    layout = moveTableToVGroup(layout, "t_gone", created.groupId);
+
+    const pruned = pruneTableVGroupMembers(layout, new Set(["t_order"]));
+    expect(pruned).not.toBe(layout);
+    expect(pruned.order).toEqual([{ type: "group", id: created.groupId, children: [{ type: "table", name: "t_order" }] }]);
+    // 无失效成员时原样返回，不触发无谓的持久化。
+    expect(pruneTableVGroupMembers(pruned, new Set(["t_order", "t_new"]))).toBe(pruned);
   });
 });
 

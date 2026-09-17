@@ -24,7 +24,7 @@ export interface TableVGroupScope {
 type TableVGroupEntry = Extract<TableVGroupOrderEntry, { type: "group" }>;
 
 export function emptyTableVGroupLayout(): TableVGroupLayout {
-  return { groups: [], order: [] };
+  return { version: TABLE_VGROUP_LAYOUT_VERSION, groups: [], order: [] };
 }
 
 export function hasTableVGroupEntries(layout: TableVGroupLayout | null | undefined): layout is TableVGroupLayout {
@@ -43,6 +43,8 @@ export function tableVGroupScopeKey(scope: TableVGroupScope): string | null {
 
 const TABLE_VGROUP_NODE_ID_PREFIX = "table-vgroup:";
 
+const TABLE_VGROUP_LAYOUT_VERSION = 1;
+
 export function tableVGroupNodeId(groupId: string): string {
   return `${TABLE_VGROUP_NODE_ID_PREFIX}${groupId}`;
 }
@@ -53,6 +55,16 @@ export function tableVGroupIdFromNodeId(nodeId: string): string | null {
 
 /** Tree node types whose direct children may contain table nodes to group. */
 const TABLE_VGROUP_CONTAINER_TYPES: ReadonlySet<TreeNode["type"]> = new Set(["database", "schema", "linked-server-schema", "group-tables"]);
+
+/** 行的身份字段即 scope 字段；分组节点与各类容器直接自带这五项。 */
+function tableVGroupScopeFieldsOf(node: TreeNode): TableVGroupScope {
+  return { connectionId: node.connectionId, catalog: node.catalog, database: node.database, schema: node.schema, linkedServer: node.linkedServer };
+}
+
+/** 承载表行的容器行：分组投影的挂载点，也是拖拽「移出分组」的落点。 */
+export function isTableVGroupContainerNode(node: TreeNode): boolean {
+  return TABLE_VGROUP_CONTAINER_TYPES.has(node.type);
+}
 
 /**
  * Selection semantics for "move to group", mirroring the connection tree: when
@@ -189,6 +201,7 @@ export function createTableVGroup(layout: TableVGroupLayout, name: string, paren
     groupId,
     layout: {
       enabled: layout.enabled,
+      version: layout.version,
       groups: [...layout.groups, group].map((current) => (parentFound && current.id === parentGroupId ? { ...current, collapsed: false } : current)),
       order,
     },
@@ -226,7 +239,7 @@ export function deleteTableVGroups(layout: TableVGroupLayout, groupIds: Iterable
 
   const order = removeGroups(layout.order);
   if (!removedGroupIds.size) return layout;
-  return { enabled: layout.enabled, groups: layout.groups.filter((group) => !removedGroupIds.has(group.id)), order };
+  return { enabled: layout.enabled, version: layout.version, groups: layout.groups.filter((group) => !removedGroupIds.has(group.id)), order };
 }
 
 export function toggleTableVGroupCollapsed(layout: TableVGroupLayout, groupId: string): TableVGroupLayout {
@@ -360,16 +373,20 @@ function buildVGroupRootNodes(entries: TableVGroupOrderEntry[], layout: TableVGr
  */
 export function applyTableVGroupsToChildren(children: TreeNode[], layout: TableVGroupLayout | null | undefined, scope: TableVGroupScope): TreeNode[] {
   if (!children.length || !layout || !tableVGroupsEnabled(layout)) return children;
+  // Idempotence: merge/refresh flows re-feed already-projected children back
+  // into setChildren, so always strip existing group containers first —
+  // otherwise stale group copies survive alongside the freshly built ones.
   const activeLayout = layout;
+  const flatChildren = stripTableVGroupsFromChildren(children);
 
   const tables = new Map<string, TableVGroupFlatTable>();
   const passthrough: Array<{ node: TreeNode; sortIndex: number }> = [];
-  for (let i = 0; i < children.length; i++) {
-    const node = children[i]!;
+  for (let i = 0; i < flatChildren.length; i++) {
+    const node = flatChildren[i]!;
     if (node.type === "table" && !tables.has(node.label)) tables.set(node.label, { node, flatIndex: i });
     else passthrough.push({ node, sortIndex: i });
   }
-  if (!tables.size) return children;
+  if (!tables.size) return flatChildren;
 
   const rootBuilt = buildVGroupRootNodes(activeLayout.order, activeLayout, tables, scope);
   // Tables the layout does not reference stay ungrouped at their original slot.
@@ -423,14 +440,7 @@ export function findTableVGroupContainerNode(nodes: TreeNode[], scope: TableVGro
   const candidates: TreeNode[] = [];
   const walk = (list: TreeNode[]) => {
     for (const node of list) {
-      if (
-        TABLE_VGROUP_CONTAINER_TYPES.has(node.type) &&
-        node.connectionId === scope.connectionId &&
-        (node.database ?? "") === (scope.database ?? "") &&
-        matchesOptional(node.catalog, scope.catalog) &&
-        matchesOptional(node.schema, scope.schema) &&
-        matchesOptional(node.linkedServer, scope.linkedServer)
-      ) {
+      if (isTableVGroupContainerNode(node) && node.connectionId === scope.connectionId && (node.database ?? "") === (scope.database ?? "") && matchesOptional(node.catalog, scope.catalog) && matchesOptional(node.schema, scope.schema) && matchesOptional(node.linkedServer, scope.linkedServer)) {
         candidates.push(node);
       }
       if (node.children) walk(node.children);
@@ -444,4 +454,125 @@ export function findTableVGroupContainerNode(nodes: TreeNode[], scope: TableVGro
     if (holder) return holder;
   }
   return candidates.find((node) => (node.children ?? []).some((child) => child.type === "table" || child.type === "table-vgroup")) ?? candidates[0]!;
+}
+
+/**
+ * Validate and repair a layout loaded from persistence: malformed JSON
+ * structures, unknown group references, and duplicate ids are dropped instead
+ * of poisoning the sidebar. Normalized layouts carry the current version.
+ */
+export function normalizeTableVGroupLayout(value: unknown): TableVGroupLayout {
+  const layout = emptyTableVGroupLayout();
+  if (!value || typeof value !== "object") return layout;
+  const raw = value as Partial<TableVGroupLayout>;
+  if (!Array.isArray(raw.groups) || !Array.isArray(raw.order)) return layout;
+
+  const seenGroupIds = new Set<string>();
+  const groups: ConnectionGroup[] = [];
+  for (const group of raw.groups) {
+    if (!group || typeof group !== "object") continue;
+    const candidate = group as Partial<ConnectionGroup>;
+    if (typeof candidate.id !== "string" || !candidate.id || typeof candidate.name !== "string" || !candidate.name) continue;
+    if (seenGroupIds.has(candidate.id)) continue;
+    seenGroupIds.add(candidate.id);
+    groups.push({ id: candidate.id, name: candidate.name, collapsed: candidate.collapsed === true });
+  }
+
+  const validGroupIds = new Set(groups.map((group) => group.id));
+  const normalizeEntries = (entries: unknown): TableVGroupOrderEntry[] => {
+    const out: TableVGroupOrderEntry[] = [];
+    if (!Array.isArray(entries)) return out;
+    for (const entry of entries) {
+      if (!entry || typeof entry !== "object") continue;
+      const candidate = entry as Partial<TableVGroupOrderEntry>;
+      if (candidate.type === "table") {
+        if (typeof candidate.name !== "string" || !candidate.name) continue;
+        out.push({ type: "table", name: candidate.name });
+      } else if (candidate.type === "group" && typeof candidate.id === "string" && candidate.id && validGroupIds.has(candidate.id)) {
+        out.push({ type: "group", id: candidate.id, children: normalizeEntries(entryChildren(candidate as TableVGroupEntry)) });
+      }
+    }
+    return out;
+  };
+  const order = normalizeEntries(raw.order);
+
+  return {
+    version: TABLE_VGROUP_LAYOUT_VERSION,
+    groups,
+    order,
+    enabled: raw.enabled !== false,
+  };
+}
+
+/**
+ * 对象分组节点（group-tables / group-views…）是宿主容器下的显示层节点，其
+ * database/schema 字段按查询语义填充（sqlite 把 main 同时填进 schema），直接取用
+ * 会让 grouped 与 simple 两种显示模式解析出不同 scope_key、把同一批表的分组劈成两份。
+ * 因此分组身份一律上溯到 database/schema 一类宿主容器。
+ */
+function findTableVGroupHostContainer(nodes: TreeNode[], node: TreeNode): TreeNode | null {
+  const walk = (list: TreeNode[], ancestors: TreeNode[]): TreeNode | null => {
+    for (const item of list) {
+      if (item.id === node.id) {
+        for (let i = ancestors.length - 1; i >= 0; i--) {
+          const ancestor = ancestors[i]!;
+          if (isTableVGroupContainerNode(ancestor)) return ancestor;
+        }
+        return null;
+      }
+      if (item.children) {
+        const found = walk(item.children, [...ancestors, item]);
+        if (found) return found;
+      }
+    }
+    return null;
+  };
+  return walk(nodes, []);
+}
+
+function tableVGroupScopeHostOf(nodes: TreeNode[], node: TreeNode): TreeNode {
+  const isDisplayGroup = typeof node.type === "string" && node.type.startsWith("group-");
+  return isDisplayGroup ? (findTableVGroupHostContainer(nodes, node) ?? node) : node;
+}
+
+/**
+ * Derive the layout scope for any sidebar row: containers and group nodes own
+ * their fields directly, while table rows resolve to their holding container —
+ * in simple display mode a table row carries a schema its container lacks, so
+ * using the row's own fields would split reads and writes across two keys.
+ */
+export function resolveTableVGroupScopeFromNode(nodes: TreeNode[], node: TreeNode | TableVGroupScope): TableVGroupScope {
+  const row = node as Partial<TreeNode> & TableVGroupScope;
+  if (row.type === "table-vgroup" || row.type?.startsWith("group-")) return tableVGroupScopeFieldsOf(tableVGroupScopeHostOf(nodes, row as TreeNode));
+  if (isTableVGroupContainerNode(row as TreeNode)) return tableVGroupScopeFieldsOf(row as TreeNode);
+  const container = findTableVGroupContainerNode(nodes, row as TreeNode, row.type === "table" ? row.label : undefined);
+  return tableVGroupScopeFieldsOf(container ? tableVGroupScopeHostOf(nodes, container) : (row as TreeNode));
+}
+
+/**
+ * Drop layout members whose names are absent from a complete, unfiltered table
+ * load (renamed or deleted tables). Callers must only pass complete lists —
+ * paginated or filtered pages cannot decide membership. Groups themselves are
+ * kept even when they end up empty: they are user-created structure, so an
+ * empty group stays visible instead of vanishing with its last table.
+ */
+export function pruneTableVGroupMembers(layout: TableVGroupLayout, keepNames: ReadonlySet<string>): TableVGroupLayout {
+  if (!hasTableVGroupEntries(layout)) return layout;
+  let changed = false;
+  const prune = (entries: TableVGroupOrderEntry[]): TableVGroupOrderEntry[] => {
+    const out: TableVGroupOrderEntry[] = [];
+    for (const entry of entries) {
+      if (entry.type === "table") {
+        if (keepNames.has(entry.name)) out.push(entry);
+        else changed = true;
+        continue;
+      }
+      const children = prune(entryChildren(entry));
+      if (children.length !== entryChildren(entry).length) changed = true;
+      out.push({ type: "group", id: entry.id, children });
+    }
+    return out;
+  };
+  const order = prune(cloneEntries(layout.order));
+  return changed ? { enabled: layout.enabled, version: layout.version, groups: layout.groups, order } : layout;
 }

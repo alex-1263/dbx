@@ -4868,6 +4868,10 @@ export async function loadTableVGroups(): Promise<Record<string, TableVGroupLayo
   return get("/api/layout/table-vgroups");
 }
 
+export async function deleteTableVGroupsForConnection(connectionId: string): Promise<void> {
+  return del(`/api/layout/table-vgroups/connection/${encodeURIComponent(connectionId)}`);
+}
+
 export async function refreshConnections(): Promise<void> {
   // Web mode doesn't maintain persistent connection pools - no-op
 }

@@ -45,3 +45,11 @@ pub async fn load_table_vgroups(State(state): State<Arc<WebState>>) -> Result<Js
     let layouts = state.app.storage.load_table_vgroups().await.map_err(AppError::from)?;
     Ok(Json(layouts))
 }
+
+pub async fn delete_table_vgroups_for_connection(
+    State(state): State<Arc<WebState>>,
+    axum::extract::Path(connection_id): axum::extract::Path<String>,
+) -> Result<Json<()>, AppError> {
+    state.app.storage.delete_table_vgroups_for_connection(&connection_id).await.map_err(AppError::from)?;
+    Ok(Json(()))
+}
