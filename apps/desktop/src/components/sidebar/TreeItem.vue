@@ -70,9 +70,14 @@ import {
 import { AI_ASSISTANT_TABLE_DROP_ROOT_SELECTOR } from "@/lib/ai/aiTableReferenceDrop";
 import { beginTableReferenceDragFeedback, isOverSqlEditorTarget, type TableReferenceDragFeedback } from "@/lib/editor/tableReferenceDragFeedback";
 import { formatSidebarObjectStorage } from "@/lib/sidebar/sidebarDatabaseStorage";
+import { effectiveRedisDatabaseIndex } from "@/lib/redis/redisDatabaseIndex";
 import { dataTabOpenModeFromTreeClick } from "@/lib/sidebar/dataTabOpenPolicy";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { selectedTableVGroupMoveTargets, tableVGroupIdFromNodeId } from "@/lib/table/tableVGroup";
+import { findTreeNodeById } from "@/lib/sql/newQueryContext";
+import { resolveTableVGroupDropTarget, setTableVGroupDropTargetNodeId, tableVGroupDropTargetNodeId } from "@/lib/sidebar/sidebarTableVGroupDrag";
 import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentation";
+import { isFocusSearchShortcut } from "@/lib/editor/keyboardShortcuts";
 import { encodeSpannerResourcePath } from "@/lib/connection/spannerResourcePath";
 import { hexToRgba } from "@/lib/common/color";
 import { sidebarDisplayTableName } from "@/lib/sidebar/sidebarTableNameDisplay";
@@ -243,6 +248,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
       return null;
     case "connection-group":
       return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-amber-500" };
+    case "table-vgroup":
+      return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-emerald-500" };
     case "database":
       return { icon: Database, colorClass: "text-yellow-500" };
     case "tablespace":
@@ -515,6 +522,13 @@ function hostForDisplay(host: string): string {
   return `[${host}]`;
 }
 
+// A Redis database is a numeric index; dirty stored values (e.g. redis-cli flags
+// pasted into the field) resolve to the index the backend actually connects with.
+function tooltipDatabaseValue(config: ConnectionConfig): string {
+  const database = cleanTooltipValue(config.database);
+  return config.db_type === "redis" && database ? effectiveRedisDatabaseIndex(database) : database;
+}
+
 function connectionTooltipUrl(config: ConnectionConfig): string {
   const explicit = cleanTooltipValue(config.connection_string);
   if (explicit) return redactedConnectionString(explicit);
@@ -532,7 +546,7 @@ function connectionTooltipUrl(config: ConnectionConfig): string {
   const port = Number(config.port) > 0 ? `:${config.port}` : "";
   const user = cleanTooltipValue(config.username);
   const userInfo = user ? `${encodeURIComponent(user)}@` : "";
-  const database = cleanTooltipValue(config.database);
+  const database = tooltipDatabaseValue(config);
   const encodedDatabase = config.db_type === "spanner" ? encodeSpannerResourcePath(database) : encodeURIComponent(database);
   const path = database ? `/${encodedDatabase}` : "";
   const params = cleanTooltipValue(config.url_params);
@@ -568,7 +582,7 @@ const detailTooltip = computed(() => {
       { label: "URL", value: connectionTooltipUrl(config), multiline: true },
       ...(hostValues.length > 0 ? [{ label: hostLabel, value: hostValues[0], values: hostValues } as DetailTooltipRow] : [{ label: hostLabel, value: hostValue, multiline: isLocalFileConnection(config) } as DetailTooltipRow]),
       { label: "Port", value: Number(config.port) > 0 ? String(config.port) : "" },
-      { label: t("connection.database"), value: cleanTooltipValue(config.database) },
+      { label: t("connection.database"), value: tooltipDatabaseValue(config) },
       { label: t("connection.user"), value: cleanTooltipValue(config.username) },
       { label: t("connection.type"), value: config.driver_label || config.driver_profile || config.db_type },
       { label: t("connection.databaseInfo.productVersion"), value: cleanTooltipValue(config.database_info?.productVersion) },
@@ -1041,6 +1055,17 @@ function clearTableSearchQuery() {
   updateTableSearchQuery("");
 }
 
+function onTableSearchControlKeydown(event: KeyboardEvent) {
+  if (isFocusSearchShortcut(event, settingsStore.editorSettings.shortcuts)) {
+    event.preventDefault();
+    const control = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+    const input = control?.querySelector<HTMLInputElement>("[data-sidebar-table-search-parent-id]");
+    input?.focus();
+    input?.select();
+  }
+  event.stopPropagation();
+}
+
 // --- Connection Group Management ---
 const isRenamingGroup = ref(false);
 
@@ -1052,7 +1077,11 @@ const renameInput = ref("");
 
 const renameInputRef = ref<HTMLInputElement>();
 
+/** Snapshot of the row being renamed: reprojecting the tree mid-rename recycles activeNode. */
+const renameTargetNode = shallowRef<TreeNode | null>(null);
+
 function startRenameGroup() {
+  renameTargetNode.value = activeNode.value;
   renameInput.value = activeNode.value.label;
   isRenamingGroup.value = true;
   emit("rename-started");
@@ -1082,6 +1111,7 @@ watch(
     if (activeNode.value.type === "connection-group") startRenameGroup();
     else if (activeNode.value.type === "saved-sql-file") startRenameSavedSql();
     else if (activeNode.value.type === "connection") startRenameConnection();
+    else if (activeNode.value.type === "table-vgroup") startRenameGroup();
   },
   { immediate: true },
 );
@@ -1103,11 +1133,17 @@ function finishRenameGroup() {
   // groups (issue #681).
   if (!isRenamingGroup.value) return;
   isRenamingGroup.value = false;
+  const target = renameTargetNode.value ?? activeNode.value;
+  renameTargetNode.value = null;
   const trimmed = renameInput.value.trim();
   // An empty name cancels the rename and keeps the group as-is — never delete
   // here. Deleting a group is done explicitly via the context menu (issue #681).
-  if (!trimmed || trimmed === activeNode.value.label) return;
-  connectionStore.renameConnectionGroup(activeNode.value.id, trimmed);
+  if (!trimmed || trimmed === target.label) return;
+  if (target.type === "table-vgroup" && target.vgroupId) {
+    connectionStore.renameTableVGroup(target, target.vgroupId, trimmed);
+    return;
+  }
+  connectionStore.renameConnectionGroup(target.id, trimmed);
 }
 
 async function finishRenameSavedSql() {
@@ -1170,6 +1206,19 @@ const {
     return;
   }
 
+  if (dragState.draggedType === "table-vgroup") {
+    const draggedGroupId = tableVGroupIdFromNodeId(draggedId);
+    const targetGroupId = tableVGroupIdFromNodeId(targetId);
+    // 落点回调是模块级单例，activeNode 未必是同容器的落点行，须用 targetId 现查。
+    const targetNode = findTreeNodeById(connectionStore.treeNodes, targetId);
+    if (draggedGroupId && targetGroupId && targetNode) connectionStore.reorderTableVGroupEntry(targetNode, draggedGroupId, targetGroupId, position);
+    return;
+  }
+
+  // 分组行只在拖动分组自身时才是合法落点：否则 targetId 不在侧边栏布局里，
+  // reorderSidebarEntries 找不到目标会把连接追加到根列表末尾。
+  if (tableVGroupIdFromNodeId(targetId)) return;
+
   // If the grabbed row is part of a multi-selection, move all selected rows
   // together; otherwise just the grabbed one (issue #681).
   const selected = connectionStore.selectedTreeNodeIds;
@@ -1179,7 +1228,7 @@ const {
 
 const canReorderTreeNode = computed(() => {
   if (props.reorderDisabled) return false;
-  return activeNode.value.type === "connection" || activeNode.value.type === "connection-group";
+  return activeNode.value.type === "connection" || activeNode.value.type === "connection-group" || activeNode.value.type === "table-vgroup";
 });
 
 function isPinnedOrderDrag(): boolean {
@@ -1188,7 +1237,7 @@ function isPinnedOrderDrag(): boolean {
 
 const dragVisual = computed(() => {
   const targetId = isPinnedOrderDrag() ? pinnedSortKey() : activeNode.value.id;
-  const isDropTarget = isPinnedOrderDrag() ? connectionStore.isPinnedTreeNodeReorderTarget(pinnedSortKey()) : activeNode.value.type === "connection" || activeNode.value.type === "connection-group";
+  const isDropTarget = isPinnedOrderDrag() ? connectionStore.isPinnedTreeNodeReorderTarget(pinnedSortKey()) : activeNode.value.type === "connection" || activeNode.value.type === "connection-group" || activeNode.value.type === "table-vgroup";
 
   return {
     isDropTarget,
@@ -1323,6 +1372,10 @@ function tableReferenceDragPayload(): QueryEditorTableReferencePayload | null {
 
 function startTableReferenceDrag(payload: QueryEditorTableReferencePayload) {
   draggingTableReferencePayload = payload;
+  // 分组成员名单只收真实表：视图/物化视图投影不识别，入组会产生隐形脏数据。
+  vgroupDragTableNames = selectedTableVGroupMoveTargets(activeNode.value, selectedTreeNodesInVisibleOrder())
+    .filter((node) => node.type === "table")
+    .map((node) => node.label);
   setActiveTableReferencePayload(payload);
   document.getSelection()?.removeAllRanges();
   referenceDragFeedback = beginTableReferenceDragFeedback(tableReferenceDragLabel(payload));
@@ -1332,11 +1385,21 @@ function finishTableReferenceDrag() {
   clearActiveTableReferencePayload(draggingTableReferencePayload);
   pendingTableReferenceDrag = null;
   draggingTableReferencePayload = null;
+  vgroupDragTableNames = [];
+  setTableVGroupDropTargetNodeId(null);
   referenceDragFeedback?.end();
   referenceDragFeedback = null;
   window.dispatchEvent(createTableReferenceDragEndEvent());
   document.removeEventListener("mousemove", onTableReferenceMouseMove, true);
   document.removeEventListener("mouseup", onTableReferenceMouseUp, true);
+}
+
+/** 本次拖拽要移动进分组的表名（拖拽开始时按选中区解析，见 startTableReferenceDrag）。 */
+let vgroupDragTableNames: string[] = [];
+
+function tableVGroupDropTargetFor(payload: QueryEditorTableReferencePayload, event: MouseEvent) {
+  if (!vgroupDragTableNames.length) return null;
+  return resolveTableVGroupDropTarget(event.clientX, event.clientY, connectionStore.treeNodes, payload);
 }
 
 function onTableReferenceMouseMove(event: MouseEvent) {
@@ -1351,6 +1414,7 @@ function onTableReferenceMouseMove(event: MouseEvent) {
     event.preventDefault();
     document.getSelection()?.removeAllRanges();
     referenceDragFeedback?.update(event.clientX, event.clientY);
+    setTableVGroupDropTargetNodeId(tableVGroupDropTargetFor(draggingTableReferencePayload, event)?.node.id ?? null);
     // 仅查询编辑器消费 hover 光标线事件；AI 面板不监听。命中判定含覆盖层拦截时的几何回退。
     if (isOverSqlEditorTarget(event.clientX, event.clientY)) {
       window.dispatchEvent(createTableReferenceHoverEvent({ clientX: event.clientX, clientY: event.clientY }));
@@ -1362,15 +1426,20 @@ function onTableReferenceMouseUp(event: MouseEvent) {
   const payload = draggingTableReferencePayload;
   if (payload) {
     suppressNextTableReferenceClick = true;
-    const target = document.elementFromPoint(event.clientX, event.clientY);
-    if (target instanceof Element && target.closest(`[data-query-editor-root], ${AI_ASSISTANT_TABLE_DROP_ROOT_SELECTOR}`)) {
-      window.dispatchEvent(
-        createTableReferenceDropEvent({
-          payload,
-          clientX: event.clientX,
-          clientY: event.clientY,
-        }),
-      );
+    const dropTarget = tableVGroupDropTargetFor(payload, event);
+    if (dropTarget) {
+      for (const tableName of vgroupDragTableNames) connectionStore.moveTableToVGroup(dropTarget.node, tableName, dropTarget.groupId);
+    } else {
+      const target = document.elementFromPoint(event.clientX, event.clientY);
+      if (target instanceof Element && target.closest(`[data-query-editor-root], ${AI_ASSISTANT_TABLE_DROP_ROOT_SELECTOR}`)) {
+        window.dispatchEvent(
+          createTableReferenceDropEvent({
+            payload,
+            clientX: event.clientX,
+            clientY: event.clientY,
+          }),
+        );
+      }
     }
   }
   finishTableReferenceDrag();
@@ -1504,7 +1573,7 @@ function onKeydown(event: KeyboardEvent) {
 </script>
 
 <template>
-  <div v-if="node.type === 'table-search-control'" class="tree-table-search-control flex h-7 items-center gap-1.5 py-0.5 pr-2" :style="tableSearchStyle" @click.stop @dblclick.stop @mousedown.stop @keydown.stop>
+  <div v-if="node.type === 'table-search-control'" data-sidebar-table-search-control class="tree-table-search-control flex h-7 items-center gap-1.5 py-0.5 pr-2" :style="tableSearchStyle" @click.stop @dblclick.stop @mousedown.stop @keydown="onTableSearchControlKeydown">
     <div class="relative min-w-0 flex-1">
       <Search class="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
       <Input
@@ -1543,7 +1612,6 @@ function onKeydown(event: KeyboardEvent) {
           rowWidthClass,
           {
             'group/sidebar-row': true,
-            'ring-1 ring-primary/50 bg-primary/5': dragVisual.showInside,
             'opacity-50': dragVisual.dragging,
             'tree-item-connection-tint': connectionColor,
             'hover:bg-accent': node.type !== 'connection',
@@ -1551,6 +1619,7 @@ function onKeydown(event: KeyboardEvent) {
             'tree-item-active': selectionVisual.rowSelected,
             'tree-item-active--selection-set': selectionVisual.usesSelectionSetHighlight && selectionVisual.rowSelected,
             'tree-item-highlight': highlighted,
+            'ring-1 ring-primary/50 bg-primary/5': dragVisual.showInside || tableVGroupDropTargetNodeId === node.id,
           },
         ]"
         :tabindex="selectionVisual.selected || selectionVisual.multiSelected ? 0 : -1"
