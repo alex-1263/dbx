@@ -38,11 +38,15 @@ export interface PluginHostBridgeApi {
   notify(pluginId: string, method: string, params?: unknown): Promise<void>;
   sendBinary(pluginId: string, channel: string, dataBase64: string): Promise<void>;
   readAsset(pluginId: string, path: string): Promise<PluginUiAssetPayload>;
-  openWorkbench?(pluginId: string, contributionId: string, context?: PluginWorkbenchContext): Promise<void> | void;
+  openWorkbench?(pluginId: string, contributionId: string, context?: PluginWorkbenchContext, options?: { forceNew?: boolean }): Promise<void> | void;
   openFilesystem?(pluginId: string, providerId: string, context?: PluginWorkbenchContext): Promise<void> | void;
+  /** Explicit user-triggered reconnect of an owned plugin connection (full flow, interactive password prompt allowed). */
+  reopenConnection?(pluginId: string, connectionId: string): Promise<void>;
   closeTab?(): Promise<void> | void;
   /** Persist plugin bytes through the host's native save dialog. Resolves null when the user cancels. */
   saveFile?(pluginId: string, request: PluginSaveFileRequest, data: Uint8Array): Promise<PluginSaveFileResult | null>;
+  /** Write text to the system clipboard on behalf of the sandboxed plugin iframe. */
+  copyText?(pluginId: string, text: string): Promise<void>;
 }
 
 interface PluginRequestMessage {
@@ -60,6 +64,9 @@ export class PluginHostBridge {
   private context: PluginWorkbenchContext;
   private locale: string;
   private theme?: PluginBridgeTheme;
+
+  /** Invoked once before each iframe load generation sends its init message. */
+  onReinit?: () => Promise<void> | void;
 
   constructor(
     private readonly plugin: InstalledPlugin,
@@ -80,7 +87,7 @@ export class PluginHostBridge {
     if (!target || event.source !== target || !isRecord(event.data)) return false;
     if (event.data.source !== PLUGIN_MESSAGE_SOURCE || event.data.version !== BRIDGE_VERSION) return false;
     if (event.data.type === "ready") {
-      this.sendInit();
+      void this.handleReady();
       return true;
     }
     if (event.data.type === "shortcut" && event.data.shortcut === "closeTab") {
@@ -92,7 +99,52 @@ export class PluginHostBridge {
     return true;
   }
 
+  private handleReady(): void {
+    this.requestInit("ready");
+  }
+
   sendInit(): void {
+    this.requestInit("load");
+  }
+
+  private requestInit(signal: "load" | "ready"): void {
+    if ((this.initSignals.load && this.initSignals.ready) || (signal === "load" && this.initSignals.load)) {
+      this.initGeneration += 1;
+      this.initSignals = { load: false, ready: false };
+      this.initStarted = false;
+    }
+    if (this.initSignals[signal]) return;
+    this.initSignals[signal] = true;
+    if (this.initStarted) return;
+    this.initStarted = true;
+    const generation = this.initGeneration;
+    const reinit = this.onReinit;
+    if (!reinit) {
+      if (!this.disposed && generation === this.initGeneration) this.postInit();
+      return;
+    }
+    void (async () => {
+      try {
+        await reinit();
+      } catch (error) {
+        console.warn("[DBX][plugin-bridge:reinit]", error);
+      }
+      // A newer load generation supersedes this one; never post a stale init.
+      if (!this.disposed && generation === this.initGeneration) this.postInit();
+    })();
+  }
+
+  /** Stop future posts (queued inits after an async reinit) for a torn-down bridge. */
+  dispose(): void {
+    this.disposed = true;
+  }
+
+  private disposed = false;
+  private initGeneration = 0;
+  private initSignals = { load: false, ready: false };
+  private initStarted = false;
+
+  private postInit(): void {
     this.post({
       source: HOST_MESSAGE_SOURCE,
       version: BRIDGE_VERSION,
@@ -184,8 +236,14 @@ export class PluginHostBridge {
       this.requirePermission("host.workbench");
       if (!this.api.openWorkbench) throw new Error("Host workbench navigation is unavailable");
       const input = requireRecord(params, "host.openWorkbench params");
-      await this.api.openWorkbench(this.plugin.manifest.id, requireProtocolName(input.contributionId, "workbench contribution"), isRecord(input.context) ? input.context : undefined);
+      await this.api.openWorkbench(this.plugin.manifest.id, requireProtocolName(input.contributionId, "workbench contribution"), isRecord(input.context) ? input.context : undefined, { forceNew: input.forceNew === true });
       return null;
+    }
+    if (method === "host.reopenConnection") {
+      if (!this.api.reopenConnection) throw new Error("Connection reopen is unavailable");
+      const input = requireRecord(params, "host.reopenConnection params");
+      await this.api.reopenConnection(this.plugin.manifest.id, requireProtocolName(input.connectionId, "connectionId"));
+      return { ok: true };
     }
     if (method === "host.openFilesystem") {
       this.requirePermission("host.filesystem");
@@ -206,6 +264,17 @@ export class PluginHostBridge {
       if (bytes.byteLength > MAX_BRIDGE_SAVE_BYTES) throw new Error(`Plugin save payload exceeds ${MAX_BRIDGE_SAVE_BYTES} bytes`);
       if (!this.api.saveFile) throw new Error("Host file saving is unavailable");
       return this.api.saveFile(this.plugin.manifest.id, { fileName: optionalTrimmedString(input.fileName), contentType: optionalTrimmedString(input.contentType) }, bytes);
+    }
+    if (method === "host.copy") {
+      const input = isRecord(params) ? params : {};
+      // The sandboxed workbench iframe has an opaque origin and no clipboard
+      // permission, so every scripted copy path is denied there; the host
+      // writes the system clipboard instead.
+      if (typeof input.text !== "string" || !input.text) throw new Error("host.copy requires text");
+      if (input.text.length > MAX_BRIDGE_PAYLOAD_BYTES) throw new Error(`Plugin copy payload exceeds ${MAX_BRIDGE_PAYLOAD_BYTES} characters`);
+      if (!this.api.copyText) throw new Error("Host clipboard is unavailable");
+      await this.api.copyText(this.plugin.manifest.id, input.text);
+      return { success: true };
     }
     throw new Error(`Unsupported plugin host method '${method}'`);
   }
@@ -230,7 +299,7 @@ export class PluginHostBridge {
 /**
  * Parse `host.network:<origin>` permission entries into CSP connect-src
  * origins. Must stay aligned with `parse_host_network_permission` in
- * crates/dbx-core/src/plugins/manifest.rs.
+ * crates/dbx-plugin-runtime/src/plugins/manifest.rs.
  */
 export function pluginNetworkOrigins(permissions: readonly string[] | undefined): string[] {
   const origins = new Set<string>();
@@ -485,14 +554,16 @@ export function pluginSdkSource(initialTheme?: PluginBridgeTheme): string {
         const asset = await request('ui.readAsset', { path });
         return URL.createObjectURL(new Blob([decode(asset.dataBase64)], { type: asset.contentType }));
       },
-      openWorkbench: (contributionId, childContext) => request('host.openWorkbench', { contributionId, context: childContext }),
+      openWorkbench: (contributionId, childContext, options) => request('host.openWorkbench', { contributionId, context: childContext, forceNew: !!(options && options.forceNew) }),
       openFilesystem: (providerId, childContext) => request('host.openFilesystem', { providerId, context: childContext }),
+      reopenConnection: (connectionId) => request('host.reopenConnection', { connectionId }),
       saveFile: (options = {}, data) => {
         if (data === undefined) return request('host.saveFile', options);
         if (typeof data === 'string') return request('host.saveFile', { ...(options || {}), dataBase64: data });
         const bytes = data instanceof ArrayBuffer ? data : (data instanceof Uint8Array ? data.buffer : new Uint8Array(data).buffer);
         return request('host.saveFile', options, { transfer: bytes });
       },
+      copy: (text) => request('host.copy', { text }),
       onEvent: (listener) => { listeners.event.add(listener); return () => listeners.event.delete(listener); },
       onBinary: (listener) => { listeners.binary.add(listener); return () => listeners.binary.delete(listener); },
       onContext: (listener) => { listeners.context.add(listener); return () => listeners.context.delete(listener); },

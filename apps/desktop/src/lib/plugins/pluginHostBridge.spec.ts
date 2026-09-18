@@ -58,6 +58,55 @@ describe("PluginHostBridge", () => {
     expect(messages[0]).toMatchObject({ source: "dbx-host", type: "init", locale: "zh-CN", context: { connectionId: "connection" } });
   });
 
+  it("runs onReinit before the init message when the iframe reloads", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const bridge = new PluginHostBridge(plugin(), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+    });
+    const ready = () => bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "ready" } } as MessageEvent);
+
+    const order: string[] = [];
+    bridge.onReinit = () =>
+      new Promise<void>((resolve) => {
+        order.push("reinit");
+        setTimeout(resolve, 5);
+      });
+    const originalPost = target.postMessage.bind(target);
+    (target as { postMessage: (m: unknown) => void }).postMessage = (message: unknown) => {
+      if ((message as { type?: string }).type === "init") order.push("init");
+      originalPost(message);
+    };
+
+    expect(ready()).toBe(true);
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(order).toEqual(["reinit", "init"]);
+  });
+
+  it("initializes only once when ready is repeated for the same bridge", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const bridge = new PluginHostBridge(plugin(), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+    });
+    const onReinit = vi.fn();
+    bridge.onReinit = onReinit;
+    const ready = () => bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "ready" } } as MessageEvent);
+
+    ready();
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    ready();
+
+    expect(onReinit).toHaveBeenCalledTimes(1);
+    expect(messages).toHaveLength(1);
+  });
+
   it("snapshots nested Vue reactive context values before sending them to the plugin", () => {
     const messages: unknown[] = [];
     const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
@@ -133,6 +182,69 @@ describe("PluginHostBridge", () => {
     } as MessageEvent);
     await vi.waitFor(() => expect(messages).toHaveLength(1));
     expect(messages[0]).toMatchObject({ id: "2", error: "Plugin has not declared permission 'host.workbench'" });
+  });
+
+  it("passes forceNew through host.openWorkbench and defaults it to false", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const openWorkbench = vi.fn();
+    const bridge = new PluginHostBridge(plugin(["host.workbench"]), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      openWorkbench,
+    });
+    const request = (id: string, params: unknown) =>
+      bridge.handleWindowMessage({
+        source: target,
+        data: { source: "dbx-plugin", version: 1, type: "request", id, method: "host.openWorkbench", params },
+      } as MessageEvent);
+
+    request("new", { contributionId: "sample.other", context: { connectionId: "c1" }, forceNew: true });
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(openWorkbench).toHaveBeenNthCalledWith(1, "sample", "sample.other", { connectionId: "c1" }, { forceNew: true });
+    expect(messages[0]).toMatchObject({ id: "new", result: null });
+
+    request("default", { contributionId: "sample.other" });
+    await vi.waitFor(() => expect(messages).toHaveLength(2));
+    expect(openWorkbench).toHaveBeenNthCalledWith(2, "sample", "sample.other", undefined, { forceNew: false });
+  });
+
+  it("reopens a plugin connection through host.reopenConnection", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const reopenConnection = vi.fn().mockResolvedValue(undefined);
+    const bridge = new PluginHostBridge(plugin(), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      reopenConnection,
+    });
+    const request = (id: string, params: unknown) =>
+      bridge.handleWindowMessage({
+        source: target,
+        data: { source: "dbx-plugin", version: 1, type: "request", id, method: "host.reopenConnection", params },
+      } as MessageEvent);
+
+    request("reopen", { connectionId: "9f1c2a34-0000-4000-8000-abcdef012345" });
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(reopenConnection).toHaveBeenCalledWith("sample", "9f1c2a34-0000-4000-8000-abcdef012345");
+    expect(messages[0]).toMatchObject({ id: "reopen", result: { ok: true } });
+
+    // Missing/invalid connectionId is rejected before reaching the host.
+    request("missing", {});
+    await vi.waitFor(() => expect(messages).toHaveLength(2));
+    expect(messages[1]).toMatchObject({ id: "missing" });
+    expect((messages[1] as { error?: string }).error).toContain("connectionId");
+
+    // Host-side failures (connection missing, not plugin-backed, connect
+    // failed) surface as the request error so the plugin can show them.
+    reopenConnection.mockRejectedValueOnce(new Error("Connection is not plugin-backed"));
+    request("not-plugin", { connectionId: "mysql-1" });
+    await vi.waitFor(() => expect(messages).toHaveLength(3));
+    expect(messages[2]).toMatchObject({ id: "not-plugin", error: "Connection is not plugin-backed" });
   });
 
   it("opens only the owning plugin filesystem with explicit permission", async () => {
@@ -292,6 +404,7 @@ describe("PluginHostBridge", () => {
     expect(document).toContain("get locale() { return locale; }");
     expect(document).toContain("openFilesystem");
     expect(document).toContain("saveFile");
+    expect(document).toContain("copy");
     expect(document).toContain("document.dispatchEvent(new CustomEvent('dbx-plugin-env'");
     expect(document).toContain("shortcut: 'closeTab'");
     expect(document).toContain("connect-src 'none'");
@@ -406,6 +519,59 @@ describe("PluginHostBridge", () => {
     await vi.waitFor(() => expect(messages).toHaveLength(2));
     expect(saveFile).toHaveBeenLastCalledWith("sample", {}, new Uint8Array([1, 2, 3]));
     expect(messages[1]).toMatchObject({ type: "response", id: "save2", result: null });
+  });
+
+  it("routes host.copy through the host clipboard and rejects bad payloads", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const copyText = vi.fn().mockResolvedValue(undefined);
+    const bridge = new PluginHostBridge(plugin(), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      copyText,
+    });
+
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "copy1", method: "host.copy", params: { text: "https://example.com/share?sig=1" } },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(copyText).toHaveBeenCalledWith("sample", "https://example.com/share?sig=1");
+    expect(messages[0]).toMatchObject({ type: "response", id: "copy1", result: { success: true } });
+
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "copy2", method: "host.copy", params: { text: "" } },
+    } as MessageEvent);
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "copy3", method: "host.copy", params: { text: "x".repeat(2 * 1024 * 1024 + 1) } },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(messages).toHaveLength(3));
+    const byId = new Map(messages.map((message) => [(message as { id?: string }).id, message]));
+    expect(byId.get("copy2")).toMatchObject({ id: "copy2", error: "host.copy requires text" });
+    // Oversized text is stopped by the generic bridge payload guard before the handler cap.
+    expect(String((byId.get("copy3") as { error?: string }).error)).toMatch(/too large|exceeds/);
+  });
+
+  it("rejects host.copy when the host has no clipboard support", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const bridge = new PluginHostBridge(plugin(), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+    });
+
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "nocopy", method: "host.copy", params: { text: "hello" } },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(messages[0]).toMatchObject({ id: "nocopy", error: "Host clipboard is unavailable" });
   });
 
   it("rejects host.saveFile without payload or host support", async () => {

@@ -9,7 +9,9 @@ export function useTauriEvents(deps: {
   openDbFilePath: (path: string) => Promise<void>;
   openConnectionDeepLink: (url: string) => Promise<void>;
   openAiConfigDeepLink: (url: string) => Promise<void>;
+  openPluginInstallDeepLink: (url: string) => Promise<void>;
   closeActiveSurface: () => void;
+  refreshPluginWorkbenches: (pluginId: string) => void;
 }) {
   const connectionStore = useConnectionStore();
   const queryStore = useQueryStore();
@@ -153,8 +155,26 @@ export function useTauriEvents(deps: {
           }
         }).then((unlisten) => unlistenHandles.push(unlisten));
 
+        listen<string[]>("dbx-open-plugin-install-links", async (event) => {
+          try {
+            for (const url of event.payload) {
+              await deps.openPluginInstallDeepLink(url);
+            }
+            focusCurrentWindow();
+          } catch (e) {
+            console.error("[DBX] dbx-open-plugin-install-links error:", e);
+          }
+        }).then((unlisten) => unlistenHandles.push(unlisten));
+
         listen("dbx-close-active-tab", () => {
           deps.closeActiveSurface();
+        }).then((unlisten) => unlistenHandles.push(unlisten));
+
+        // A plugin was installed/rolled back from its already-replaced runtime:
+        // open workbench tabs still render the previous UI bundle until they
+        // reload, so hand them the new identity to pick up.
+        listen<{ pluginId: string; version: string }>("plugin-runtime-replaced", (event) => {
+          if (event.payload?.pluginId) deps.refreshPluginWorkbenches(event.payload.pluginId);
         }).then((unlisten) => unlistenHandles.push(unlisten));
       })
       .catch(() => {});

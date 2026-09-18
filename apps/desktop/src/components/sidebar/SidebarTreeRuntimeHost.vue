@@ -87,6 +87,7 @@ import { connectionGroupDestinationRows } from "@/lib/sidebar/sidebarLayout";
 import { hasTableVGroupEntries, selectedTableVGroupMoveTargets, tableVGroupDestinationRows, tableVGroupPathForTable, tableVGroupsEnabled } from "@/lib/table/tableVGroup";
 import { objectTypesForGroupNode } from "@/lib/table/tableTree";
 import { loadSidebarObjectGroup } from "@/lib/sidebar/sidebarObjectGroupRouting";
+import { requestObjectBrowserSearchFocus } from "@/lib/tabs/objectBrowserSearchFocus";
 import { isXuguTypeMemberContainer } from "@/lib/sidebar/xuguTypeMembers";
 import { isXuguSyntheticTreeNode } from "@/lib/sidebar/xuguPublicSynonyms";
 import { buildXuguSchedulerJobSql, type XuguSchedulerJobAction } from "@/lib/database/xuguSchedulerJobSql";
@@ -128,7 +129,7 @@ import { dataTabOpenModeFromTreeClick, type DataTabOpenMode } from "@/lib/sideba
 import { isCopySidebarSelectionShortcut, isEditSidebarConnectionShortcut, isModRShortcut, isPasteSidebarSelectionShortcut } from "@/lib/editor/keyboardShortcuts";
 import { handleSidebarTreeDeleteShortcut } from "@/lib/sidebar/sidebarTreeDeleteShortcut";
 import { dataTableDoubleClickAction } from "@/lib/tabs/dataTabActivation";
-import { attachedDatabaseNameFromPath, buildCreateDatabaseSql, buildDuckDbAttachDatabaseSql, buildSqliteAttachDatabaseSql, supportsCreateDatabaseCharset, uniqueAttachedDatabaseName } from "@/lib/database/createDatabaseSql";
+import { attachedDatabaseNameFromPath, buildCreateDatabaseSql, buildDuckDbAttachDatabaseSql, buildSqliteAttachDatabaseSql, supportsCreateDatabaseCharset, supportsCreateDatabaseLocale, uniqueAttachedDatabaseName } from "@/lib/database/createDatabaseSql";
 import { appendCreateDatabaseErrorHint } from "@/lib/database/createDatabaseErrorHints";
 import { SQLITE_DATABASE_FILE_EXTENSIONS } from "@/lib/database/databaseFileDetection";
 import {
@@ -160,7 +161,6 @@ import { buildRenameObjectSql, buildRenameDatabaseSql, buildRenameDatabasePrefli
 import { buildRoutineRenameObjectSourceStatements, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
 import { buildViewDdl } from "@/lib/table/viewDdl";
 import { formatSqlForDisplay, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
-import { omitDdlIdentifierQuotes } from "@/lib/sql/ddlDisplay";
 import { getTableStructureCapabilities } from "@/lib/table/tableStructureCapabilities";
 import { connectionObjectTreeNodeSchema, connectionObjectTreeQuerySchema, connectionTableSqlSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, tableStructureDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { isObjectCacheInvalidationError } from "@/lib/metadata/objectCacheInvalidationError";
@@ -190,7 +190,7 @@ import { sidebarTreeArrowAction } from "@/lib/sidebar/sidebarTreeArrowNavigation
 import { batchTableEmptyFeedback, runBatchTableEmpty } from "@/lib/sidebar/batchTableEmpty";
 import { runBatchTableTruncate } from "@/lib/table/batchTableTruncate";
 import { runBatchTableDrop } from "@/lib/table/batchTableDrop";
-import { buildSidebarDdlTemplateSql } from "@/lib/sidebar/sidebarDdlTemplate";
+import { buildSidebarDdlTemplateSql, formatSidebarDdlTemplateForDisplay } from "@/lib/sidebar/sidebarDdlTemplate";
 import { resolveSidebarDdlTargets } from "@/lib/sidebar/sidebarDdlTargets";
 import { sidebarTableDataExportTargets } from "@/lib/sidebar/sidebarExportRuntime";
 import { formatSidebarTableCopyText, type FormatSidebarTableNamesOptions } from "@/lib/sidebar/sidebarTableNameCopy";
@@ -203,10 +203,11 @@ import { savedSqlClipboardFileIds, savedSqlPasteTargetForNode } from "@/lib/save
 import { exportSavedSqlFileContent } from "@/lib/savedSql/savedSqlExport";
 import { isSqlServerLinkedNode } from "@/lib/database/sqlServerLinkedServers";
 import { flattenTree } from "@/composables/useFlatTree";
-import { createDatabaseCollationOptionsForCharset, nextCreateDatabaseCollation, normalizeCreateDatabaseCharset, parseCreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
+import { createDatabaseCollationOptionsForCharset, DEFAULT_GBASE8S_DATABASE_LOCALE, defaultGbase8sDatabaseLocale, GBASE8S_DATABASE_LOCALES, nextCreateDatabaseCollation, normalizeCreateDatabaseCharset, parseCreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
 import { executeWithProductionContextGuard, executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAccess";
 import { buildXuguCompileSql } from "@/lib/database/xuguCompileSql";
+import { buildDamengCompileViewSql } from "@/lib/database/damengCompileSql";
 import type { SidebarDataOpenRequest } from "@/lib/sidebar/sidebarDataOpenCoordinator";
 import { createSidebarActionTarget, findSidebarActionTarget, releaseRemovedSidebarActionTarget, type SidebarActionTarget } from "@/lib/sidebar/sidebarActionTarget";
 import { createSidebarMenuContext, normalizeSidebarMenuDescriptors } from "@/lib/sidebar/sidebarTreeMenuDescriptors";
@@ -340,6 +341,9 @@ import {
   editDatabaseCollation,
   editDatabaseCommentText,
   showEditSchemaCommentDialog,
+  showCompileErrorDialog,
+  compileErrorTitle,
+  compileErrorMessage,
   schemaCommentText,
   schemaCommentLoading,
   schemaCommentPreviewSql,
@@ -418,15 +422,31 @@ const { copyStructureAs, copyStructureDocText, copyStructurePreview, exportData,
   acceptedSelectionIds: () => acceptedSelectionIds,
 });
 
-const { openAllDatabasesExport, openDataCompare, openDatabaseExport, openDatabaseSearch, openDiagram, openDocs, openFieldLineage, openMongoImport, openScheduledBackups, openSchemaDiff, openSchemaDiffForRoutine, openSqlFileExecution, openStructureEditor, openTableImport, openTransfer } =
-  useSidebarTreeToolRuntime({
-    activeNode,
-    connectionStore,
-    queryStore,
-    settingsStore,
-    tableChildObjectName: tableChildDropObjectName,
-    acceptedSelectionIds: () => acceptedSelectionIds,
-  });
+const {
+  openAllDatabasesExport,
+  openDataCompare,
+  openDatabaseExport,
+  openDatabaseSearch,
+  openDiagram,
+  openDocs,
+  openFieldLineage,
+  openMongoImport,
+  openMongoDatabaseDump,
+  openScheduledBackups,
+  openSchemaDiff,
+  openSchemaDiffForRoutine,
+  openSqlFileExecution,
+  openStructureEditor,
+  openTableImport,
+  openTransfer,
+} = useSidebarTreeToolRuntime({
+  activeNode,
+  connectionStore,
+  queryStore,
+  settingsStore,
+  tableChildObjectName: tableChildDropObjectName,
+  acceptedSelectionIds: () => acceptedSelectionIds,
+});
 
 const emit = defineEmits<{
   "rename-started": [];
@@ -1111,9 +1131,9 @@ function runRowClickAction(clickDetail: number, requestId: number) {
   if (action === "open-data") {
     scheduleOpenData(node);
   } else if (action === "open-object-browser") {
-    void openObjectBrowser();
+    void openObjectBrowser(false, false, true);
   } else if (action === "open-object-browser-and-expand") {
-    void openObjectBrowser();
+    void openObjectBrowser(false, false, true);
     if (!node.isExpanded) void toggle();
   } else if (action === "open-source") {
     openObjectSourceDialog(false);
@@ -1507,9 +1527,9 @@ function onDoubleClick(event: MouseEvent) {
   if (action === "open-database-browser") {
     void openDatabaseBrowser();
   } else if (action === "open-object-browser") {
-    void openObjectBrowser();
+    void openObjectBrowser(false, false, true);
   } else if (action === "open-object-browser-and-expand") {
-    void openObjectBrowser();
+    void openObjectBrowser(false, false, true);
     if (!activeNode.value.isExpanded) void toggle();
   } else if (action === "open-data") {
     openDataImmediately(activeNode.value);
@@ -1656,7 +1676,7 @@ async function confirmDeleteSavedSqlFile() {
   releaseActiveNodeReference([node.id]);
 }
 
-async function openObjectBrowser(eventReadOnly = false, openEventEditor: boolean | "create" = false) {
+async function openObjectBrowser(eventReadOnly = false, openEventEditor: boolean | "create" = false, focusSearch = false) {
   const node = activeNode.value;
   if (!node.connectionId) return;
   try {
@@ -1674,13 +1694,15 @@ async function openObjectBrowser(eventReadOnly = false, openEventEditor: boolean
       return;
     }
     if (hasTreeNodeDatabaseContext(node)) {
-      queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, eventName, eventReadOnly, objectFilter, eventCreateRequestId);
+      const tabId = queryStore.openObjectBrowser(node.connectionId, node.database, node.schema, node.catalog, eventName, eventReadOnly, objectFilter, eventCreateRequestId);
+      if (focusSearch) await nextTick(() => requestObjectBrowserSearchFocus(tabId));
       return;
     }
     const options = await getDatabaseOptions(node.connectionId);
     const database = resolveDefaultDatabase(connection, options);
     if (database) {
-      queryStore.openObjectBrowser(node.connectionId, database, undefined, undefined, eventName, eventReadOnly, objectFilter, eventCreateRequestId);
+      const tabId = queryStore.openObjectBrowser(node.connectionId, database, undefined, undefined, eventName, eventReadOnly, objectFilter, eventCreateRequestId);
+      if (focusSearch) await nextTick(() => requestObjectBrowserSearchFocus(tabId));
     } else {
       await toggle();
     }
@@ -2152,7 +2174,7 @@ async function openSidebarMultiTableDdlTab(targets: Array<TreeNode & { connectio
     async (ddl, target) => {
       const formatDialect = sqlFormatDialectForDbType(databaseTypeForNode(target));
       const formatted = await formatSqlForDisplay(ddl, formatDialect, settingsStore.editorSettings.sqlFormatter);
-      return settingsStore.editorSettings.generateSqlQuoteIdentifiers ? formatted : omitDdlIdentifierQuotes(formatted, formatDialect);
+      return formatSidebarDdlTemplateForDisplay(formatted, formatDialect, databaseTypeForNode(target), settingsStore.editorSettings.generateSqlIncludeDatabaseName, settingsStore.editorSettings.generateSqlQuoteIdentifiers, target.catalog);
     },
   );
   connectionStore.activeConnectionId = tabTarget.connectionId;
@@ -2618,6 +2640,36 @@ async function compileXuguObject() {
     await connectionStore.refreshTreeNode(node);
   } catch (e: any) {
     toast(t("contextMenu.tableOperationFailed", { message: e?.message || String(e) }), 5000);
+  }
+}
+
+async function compileDamengView() {
+  const node = activeNode.value;
+  if (currentDatabaseType() !== "dameng" || node.type !== "view" || !node.connectionId || !node.database) return;
+  const sql = buildDamengCompileViewSql({ schema: node.schema, name: node.objectName || node.label });
+  if (!sql) return;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    const executed = await executeTreeNodeSqlWithProductionGuard(node, sql, { database: node.database, schema: node.schema });
+    if (!executed) return;
+    toast(t("contextMenu.compileObjectSuccess", { name: node.label }), 3000);
+    await connectionStore.refreshObjectListTreeNode(node.connectionId, node.database, node.schema);
+    window.dispatchEvent(
+      new CustomEvent("dbx-refresh-object-browser", {
+        detail: {
+          connectionId: node.connectionId,
+          database: node.database,
+          schema: node.schema,
+          catalog: node.catalog,
+        },
+      }),
+    );
+  } catch (e: any) {
+    compileErrorTitle.value = t("contextMenu.compileObjectFailedTitle");
+    compileErrorMessage.value = t("contextMenu.compileObjectFailedMessage", { name: node.label, message: e?.message || String(e) });
+    claimTreeItemDialogOwnership();
+    routeTreeItemDialogController();
+    showCompileErrorDialog.value = true;
   }
 }
 
@@ -3522,9 +3574,14 @@ const canSetCreateDatabaseCharset = computed(() => {
   return connectionNamespaceCreationTarget(config) === "database" && supportsCreateDatabaseCharset(config?.db_type, config?.driver_profile);
 });
 
+const canSetCreateDatabaseLocale = computed(() => {
+  const config = activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined;
+  return connectionNamespaceCreationTarget(config) === "database" && supportsCreateDatabaseLocale(config?.db_type, config?.driver_profile);
+});
+
 const canDropDatabase = computed(() => {
   const config = activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined;
-  return activeNode.value.type === "database" && !isSqlServerLinkedNode(activeNode.value) && supportsDatabaseCreation(config?.db_type);
+  return activeNode.value.type === "database" && !isSqlServerLinkedNode(activeNode.value) && (supportsDatabaseCreation(config?.db_type) || supportsCreateDatabaseLocale(config?.db_type, config?.driver_profile));
 });
 
 const databasePropertyGroups = computed(() => {
@@ -3828,7 +3885,16 @@ function openCreateDatabaseDialog() {
   createDatabaseCharsetOptions.value = fallbackCreateDatabaseCharset.charsets;
   createDatabaseCollationsByCharset.value = fallbackCreateDatabaseCharset.collationsByCharset;
   showCreateDatabaseDialog.value = true;
-  if (canSetCreateDatabaseCharset.value) {
+  if (canSetCreateDatabaseLocale.value) {
+    // GBase 8s / Informix: the "charset" control selects the new database's DB_LOCALE, which the
+    // agent applies by opening the CREATE DATABASE session with it. Seed a UTF-8 default, then
+    // repopulate the options with the collations already present on the connected instance.
+    createDatabaseCharsetOptions.value = [...GBASE8S_DATABASE_LOCALES];
+    createDatabaseCollationsByCharset.value = {};
+    createDatabaseCharset.value = DEFAULT_GBASE8S_DATABASE_LOCALE;
+    createDatabaseCollation.value = "";
+    void loadGbase8sDatabaseLocales();
+  } else if (canSetCreateDatabaseCharset.value) {
     void loadCreateDatabaseCharsetMetadata();
   }
   void loadCreateDatabaseUsers();
@@ -3947,6 +4013,33 @@ async function loadCreateDatabaseCharsetMetadata(target: "create" | "edit" = "cr
   } catch {
     createDatabaseCharsetOptions.value = fallbackCreateDatabaseCharset.charsets;
     createDatabaseCollationsByCharset.value = fallbackCreateDatabaseCharset.collationsByCharset;
+  } finally {
+    createDatabaseCharsetLoading.value = false;
+  }
+}
+
+async function loadGbase8sDatabaseLocales() {
+  const node = activeNode.value;
+  if (!node.connectionId) return;
+  createDatabaseCharsetLoading.value = true;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    const result = await api.executeQuery(node.connectionId, "", "SELECT DISTINCT dbs_collate FROM sysmaster:sysdbslocale ORDER BY 1", undefined, undefined, { maxRows: 500 });
+    if (!showCreateDatabaseDialog.value) return;
+    const idx = result.columns.findIndex((column) => column.trim().toLowerCase() === "dbs_collate");
+    const locales = [...new Set(result.rows.map((row) => String(row[idx >= 0 ? idx : 0] ?? "").trim()).filter(Boolean))];
+    if (!locales.length) throw new Error("no collations");
+    createDatabaseCharsetOptions.value = locales;
+    createDatabaseCollationsByCharset.value = {};
+    if (!locales.includes(createDatabaseCharset.value)) {
+      updateCreateDatabaseCharset(defaultGbase8sDatabaseLocale(locales));
+    }
+  } catch {
+    createDatabaseCharsetOptions.value = [...GBASE8S_DATABASE_LOCALES];
+    createDatabaseCollationsByCharset.value = {};
+    if (!createDatabaseCharsetOptions.value.includes(createDatabaseCharset.value)) {
+      updateCreateDatabaseCharset(DEFAULT_GBASE8S_DATABASE_LOCALE);
+    }
   } finally {
     createDatabaseCharsetLoading.value = false;
   }
@@ -4578,7 +4671,7 @@ const canOpenSqlFileExecution = computed(() => {
 const canExportAllDatabases = computed(() => {
   if (activeNode.value.type !== "connection" || !activeNode.value.connectionId) return false;
   const dbType = connectionStore.getConfig(activeNode.value.connectionId)?.db_type;
-  return !["redis", "mongodb", "dynamodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos"].includes(dbType || "");
+  return !["redis", "mongodb", "dynamodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos", "plugin"].includes(dbType || "");
 });
 
 const canOpenScheduledBackups = computed(() => {
@@ -5153,7 +5246,7 @@ function databaseDialogCapabilities() {
   return {
     showCreateDatabaseDialog,
     createDatabaseName,
-    canSetCreateDatabaseCharset: canSetCreateDatabaseCharset.value,
+    canSetCreateDatabaseCharset: canSetCreateDatabaseCharset.value || canSetCreateDatabaseLocale.value,
     createDatabaseCharset,
     createDatabaseCharsetOptions,
     createDatabaseCharsetLoading,
@@ -5254,6 +5347,9 @@ function databaseSpecificDialogCapabilities() {
     createSchemaName,
     confirmCreateSchema,
     showEditSchemaCommentDialog,
+    showCompileErrorDialog,
+    compileErrorTitle,
+    compileErrorMessage,
     schemaCommentText,
     schemaCommentLoading,
     schemaCommentPreviewSql,
@@ -5592,6 +5688,11 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
       shortcut: shortcutDelete,
       variant: "destructive" as const,
     });
+    // Plugin-contributed entries must be appended before this branch returns.
+    // treeItemMenuItems() stops at the first factory that reports the node as
+    // handled, so a call placed after the factory loop never runs for a
+    // connection node.
+    appendPluginConnectionMenuItems(items, node);
     return true;
   }
 
@@ -5881,6 +5982,8 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     if (node.type === "mongo-db") {
       items.push({ label: "", separator: true });
       items.push({ label: t("transfer.dataTransfer"), action: openTransfer, icon: ArrowRightLeft });
+      items.push({ label: t("mongoDump.menuDump"), action: () => openMongoDatabaseDump("dump"), icon: Upload });
+      items.push({ label: t("mongoDump.menuRestore"), action: () => openMongoDatabaseDump("restore"), icon: Download });
     }
     if (node.type === "redis-db") {
       items.push({ label: "", separator: true });
@@ -5961,6 +6064,8 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
       children: [
         { label: "CSV", action: () => void exportMongoCollection("csv") },
         { label: "NDJSON", action: () => void exportMongoCollection("ndjson") },
+        { label: "BSON dump", action: () => void exportMongoCollection("bson") },
+        { label: "BSON dump (gzip)", action: () => void exportMongoCollection("bsonGzip") },
       ],
     });
     if (canDropMongoCollection.value) {
@@ -6052,6 +6157,9 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     if (node.type === "view" || node.type === "materialized_view") {
       items.push({ label: t("contextMenu.editView"), action: () => openObjectSourceDialog(true), icon: Pencil });
       items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+      if (node.type === "view" && currentDatabaseType() === "dameng" && buildDamengCompileViewSql({ schema: node.schema, name: node.objectName || node.label })) {
+        items.push({ label: t("contextMenu.compileObject"), action: compileDamengView, icon: Wrench });
+      }
       items.push({
         label: t("contextMenu.viewDdl"),
         action: openDdl,
@@ -6558,8 +6666,6 @@ function treeItemMenuItems(): ContextMenuItem[] {
     items.push({ label: "", separator: true });
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
   }
-
-  appendPluginConnectionMenuItems(items, node);
 
   return items;
 }

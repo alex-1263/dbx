@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import DdlStorageToggle from "@/components/objects/DdlStorageToggle.vue";
+import { structurePreviewHasOceanBase } from "./sidebarTreeDialogState";
 import { computed, toRefs, watch } from "vue";
 import { AlertTriangle, Check, Loader2, Clipboard, Plus, Trash2, Upload } from "@lucide/vue";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
@@ -131,6 +133,9 @@ const {
   createSchemaName,
   confirmCreateSchema,
   showEditSchemaCommentDialog,
+  showCompileErrorDialog,
+  compileErrorTitle,
+  compileErrorMessage,
   schemaCommentText,
   schemaCommentLoading,
   schemaCommentPreviewSql,
@@ -207,6 +212,7 @@ watch(
     showRedisDatabaseAliasDialog,
     showCreateSchemaDialog,
     showEditSchemaCommentDialog,
+    showCompileErrorDialog,
   ],
   (open) => {
     if (open.every((value) => !value)) emit("closed");
@@ -429,6 +435,7 @@ watch(
         <pre v-else class="max-h-[56vh] min-h-64 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(structurePreviewSql)"></pre>
       </div>
       <DialogFooter>
+        <DdlStorageToggle :database-type="structurePreviewHasOceanBase ? 'oceanbase-oracle' : undefined" :disabled="isLoadingStructurePreview || !!structurePreviewError" class="mr-auto" />
         <Button variant="outline" @click="showStructurePreviewDialog = false">{{ t("dangerDialog.cancel") }}</Button>
         <Button variant="outline" :disabled="isLoadingStructurePreview || !structurePreviewSql" @click="copyStructurePreview">
           <Clipboard class="h-4 w-4" />
@@ -538,7 +545,9 @@ watch(
             </template>
           </SearchableSelect>
         </div>
-        <div class="grid gap-1.5">
+        <!-- The gbase8s locale path has no collations; only show the picker when the selected
+             charset actually has collation options (MySQL always does). -->
+        <div v-if="createDatabaseCollationOptionsForCharset(createDatabaseCharset, createDatabaseCollationsByCharset).length > 0" class="grid gap-1.5">
           <label class="text-xs font-medium text-muted-foreground">{{ t("contextMenu.createDatabaseCollation") }}</label>
           <SearchableSelect
             v-model="createDatabaseCollation"
@@ -591,21 +600,23 @@ watch(
   </Dialog>
 
   <Dialog :open="showCreateDatabasePreviewDialog" @update:open="updateCreateDatabasePreviewDialog">
-    <DialogContent class="sm:max-w-[720px]">
+    <DialogContent class="sm:max-w-[720px] grid-rows-[auto_minmax(0,1fr)_auto]">
       <DialogHeader>
         <DialogTitle>{{ t("contextMenu.createDatabaseSqlPreview") }}</DialogTitle>
       </DialogHeader>
-      <pre class="max-h-[48vh] min-h-44 overflow-auto whitespace-pre-wrap rounded-md border bg-muted/30 p-3 font-mono text-xs leading-5" v-html="highlight(createDatabasePreviewSql)" />
-      <div v-if="createDatabaseAuthorizationResults.length > 0" class="grid gap-2 rounded-md border p-3">
-        <div v-for="result in createDatabaseAuthorizationResults" :key="result.step.id" class="flex items-start gap-2 text-xs">
-          <Check v-if="result.status === 'success'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-green-600" />
-          <AlertTriangle v-else-if="result.status === 'failed'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
-          <span v-else class="mt-1 h-2 w-2 shrink-0 rounded-full bg-muted-foreground" />
-          <span class="min-w-0">
-            <span class="block">{{ createDatabaseAuthorizationStepLabel(result) }}</span>
-            <span v-if="result.message" class="mt-0.5 block break-all text-destructive">{{ result.message }}</span>
-            <span v-else-if="result.status === 'skipped'" class="mt-0.5 block text-muted-foreground">{{ t("contextMenu.createDatabaseStepSkipped") }}</span>
-          </span>
+      <div class="grid min-h-0 max-h-full min-w-0 gap-3 overflow-hidden" :class="createDatabaseAuthorizationResults.length > 0 ? 'h-[70vh] grid-rows-[minmax(0,1fr)_minmax(0,1fr)]' : 'h-[48vh] grid-rows-[minmax(0,1fr)]'">
+        <pre class="min-h-0 min-w-0 overflow-auto overscroll-contain whitespace-pre-wrap rounded-md border bg-muted/30 p-3 font-mono text-xs leading-5" v-html="highlight(createDatabasePreviewSql)" />
+        <div v-if="createDatabaseAuthorizationResults.length > 0" class="grid min-h-0 min-w-0 content-start gap-2 overflow-y-auto overscroll-contain rounded-md border p-3">
+          <div v-for="result in createDatabaseAuthorizationResults" :key="result.step.id" class="flex items-start gap-2 text-xs">
+            <Check v-if="result.status === 'success'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-green-600" />
+            <AlertTriangle v-else-if="result.status === 'failed'" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-destructive" />
+            <span v-else class="mt-1 h-2 w-2 shrink-0 rounded-full bg-muted-foreground" />
+            <span class="min-w-0">
+              <span class="block">{{ createDatabaseAuthorizationStepLabel(result) }}</span>
+              <span v-if="result.message" class="mt-0.5 block break-all text-destructive">{{ result.message }}</span>
+              <span v-else-if="result.status === 'skipped'" class="mt-0.5 block text-muted-foreground">{{ t("contextMenu.createDatabaseStepSkipped") }}</span>
+            </span>
+          </div>
         </div>
       </div>
       <DialogFooter>
@@ -800,6 +811,18 @@ watch(
         <Button :disabled="schemaCommentLoading" @click="confirmEditSchemaComment">
           {{ schemaCommentLoading ? t("contextMenu.schemaCommentSaving") : t("dangerDialog.confirm") }}
         </Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
+
+  <Dialog v-model:open="showCompileErrorDialog">
+    <DialogContent class="sm:max-w-[560px]">
+      <DialogHeader>
+        <DialogTitle>{{ compileErrorTitle }}</DialogTitle>
+      </DialogHeader>
+      <pre class="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded bg-destructive/5 p-3 text-sm text-destructive">{{ compileErrorMessage }}</pre>
+      <DialogFooter>
+        <Button @click="showCompileErrorDialog = false">{{ t("common.close") }}</Button>
       </DialogFooter>
     </DialogContent>
   </Dialog>

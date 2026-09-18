@@ -10,6 +10,7 @@ use dbx_core::{
     agent_tools::{self, format_query_result_as_text, AgentSqlPermissions, QueryCellWindow},
     connection::{connection_configs_pool_equivalent, AppState},
     db::{mongo_driver::MongoIndexSpec, redis_driver::RedisCommandResult, ColumnInfo, TableInfo},
+    history::HistoryEntry,
     mcp_policy::{connection_group_paths, McpConnectionGroupPath},
     models::connection::{ConnectionConfig, DatabaseType},
     storage::{DesktopSettings, McpGlobalPolicy, McpGlobalPolicyState, Storage},
@@ -180,6 +181,10 @@ pub trait DbxBackend: Send + Sync {
     async fn load_mcp_global_policy(&self) -> Result<McpGlobalPolicy, String>;
 
     async fn load_connections(&self) -> Result<Vec<ConnectionConfig>, String>;
+    async fn save_history_entry(&self, entry: &HistoryEntry) -> Result<(), String> {
+        let _ = entry;
+        Err("Query history is not supported by this backend.".to_string())
+    }
     /// Return database names visible to the DBX connection itself. The MCP
     /// server applies its own database-scope policy before exposing these
     /// names to a client.
@@ -769,6 +774,10 @@ impl DbxBackend for LocalBackend {
         Ok(configs)
     }
 
+    async fn save_history_entry(&self, entry: &HistoryEntry) -> Result<(), String> {
+        self.state.storage.save_history_entry(entry).await
+    }
+
     async fn list_databases(&self, connection: &ConnectionConfig) -> Result<Vec<String>, String> {
         if connection.db_type == DatabaseType::MongoDb {
             if self.state.pool_handle(&connection.id).await.is_none() {
@@ -1103,6 +1112,11 @@ impl DbxBackend for WebBackend {
             .json()
             .await
             .map_err(|error| format!("Invalid connection list response: {error}"))
+    }
+
+    async fn save_history_entry(&self, entry: &HistoryEntry) -> Result<(), String> {
+        self.request(reqwest::Method::POST, "/api/history/save", Some(json!({ "entry": entry }))).await?;
+        Ok(())
     }
 
     async fn list_databases(&self, connection: &ConnectionConfig) -> Result<Vec<String>, String> {
@@ -1447,6 +1461,7 @@ impl DbxBackend for WebBackend {
                     Some(TableInfo {
                         name,
                         table_type: "COLLECTION".to_string(),
+                        valid: None,
                         comment: None,
                         parent_schema: None,
                         parent_name: None,
@@ -1637,6 +1652,9 @@ impl DbxBackend for WebBackend {
         self.ensure_connected(connection).await?;
         let connection_id = &connection.id;
         match command {
+            MongoCommand::InDatabase { database, command } => {
+                Box::pin(self.execute_mongo_command(connection, database, command)).await
+            }
             MongoCommand::Version => {
                 let version: String = self
                     .request(
@@ -1860,6 +1878,45 @@ impl DbxBackend for WebBackend {
                     .map_err(|error| format!("Invalid MongoDB insert response: {error}"))?;
                 Ok(affected_query_result(affected_rows_from_value(&value)))
             }
+            MongoCommand::BulkWrite { collection, operations, options } => {
+                let result: dbx_core::db::mongo_driver::MongoBulkWriteResult = self
+                    .request(
+                        reqwest::Method::POST,
+                        "/api/mongo/bulk-write",
+                        Some(json!({
+                            "connectionId": connection_id,
+                            "database": database,
+                            "collection": collection,
+                            "operationsJson": operations,
+                            "optionsJson": options,
+                        })),
+                    )
+                    .await?
+                    .json()
+                    .await
+                    .map_err(|error| format!("Invalid MongoDB bulkWrite response: {error}"))?;
+                Ok(dbx_core::mongo_ops::mongo_bulk_write_query_result(&result))
+            }
+            MongoCommand::Replace { collection, filter, replacement, options } => {
+                let value: Value = self
+                    .request(
+                        reqwest::Method::POST,
+                        "/api/mongo/replace-document",
+                        Some(json!({
+                            "connectionId": connection_id,
+                            "database": database,
+                            "collection": collection,
+                            "filterJson": filter,
+                            "replacementJson": replacement,
+                            "optionsJson": options,
+                        })),
+                    )
+                    .await?
+                    .json()
+                    .await
+                    .map_err(|error| format!("Invalid MongoDB replace response: {error}"))?;
+                Ok(affected_query_result(affected_rows_from_value(&value)))
+            }
             MongoCommand::Update { collection, filter, update, options, many } => {
                 let value: Value = self
                     .request(
@@ -1979,6 +2036,20 @@ impl DbxBackend for WebBackend {
                     })
                     .collect::<Vec<_>>();
                 Ok(mongo_drop_indexes_query_result(dropped_names, failures, affected_rows_from_value(&value)))
+            }
+            MongoCommand::RenameCollection { collection, new_name } => {
+                self.request(
+                    reqwest::Method::POST,
+                    "/api/mongo/rename-collection",
+                    Some(json!({
+                        "connectionId": connection_id,
+                        "database": database,
+                        "collection": collection,
+                        "newName": new_name,
+                    })),
+                )
+                .await?;
+                Ok(scalar_query_result("renamed", Value::String(format!("{collection} -> {new_name}"))))
             }
             MongoCommand::DropCollection { collection } => {
                 self.request(

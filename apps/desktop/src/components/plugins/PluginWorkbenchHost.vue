@@ -3,10 +3,13 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { AlertTriangle, Loader2 } from "@lucide/vue";
 import * as api from "@/lib/backend/api";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
+import { copyToClipboard } from "@/lib/common/clipboard";
 import { PluginHostBridge, pluginSandboxDocument, type PluginBridgeTheme, type PluginSaveFileRequest, type PluginSaveFileResult, type PluginWorkbenchContext } from "@/lib/plugins/pluginHostBridge";
 import type { InstalledPlugin, PluginWorkbenchContribution } from "@/types/database";
 import { useI18n } from "vue-i18n";
 import { useTheme } from "@/composables/useTheme";
+import { useSettingsStore } from "@/stores/settingsStore";
+import { useConnectionStore } from "@/stores/connectionStore";
 
 const props = withDefaults(
   defineProps<{
@@ -20,13 +23,14 @@ const props = withDefaults(
 const emit = defineEmits<{
   ready: [];
   error: [message: string];
-  openWorkbench: [pluginId: string, contributionId: string, context?: PluginWorkbenchContext];
+  openWorkbench: [pluginId: string, contributionId: string, context?: PluginWorkbenchContext, options?: { forceNew?: boolean }];
   openFilesystem: [pluginId: string, providerId: string, context?: PluginWorkbenchContext];
   closeTab: [];
 }>();
 
 const { t, locale: appLocale } = useI18n();
 const { isDark, themeRevision } = useTheme();
+const settingsStore = useSettingsStore();
 const iframe = ref<HTMLIFrameElement>();
 const source = ref("");
 const loading = ref(true);
@@ -69,14 +73,26 @@ function createBridge() {
       notify: api.notifyPlugin,
       sendBinary: api.sendPluginBinary,
       readAsset: api.readPluginUiAsset,
-      openWorkbench: async (pluginId, contributionId, context) => emit("openWorkbench", pluginId, contributionId, context),
+      openWorkbench: async (pluginId, contributionId, context, options) => emit("openWorkbench", pluginId, contributionId, context, options),
       openFilesystem: async (pluginId, providerId, context) => emit("openFilesystem", pluginId, providerId, context),
+      reopenConnection: (pluginId, connectionId) => useConnectionStore().reopenPluginConnection(connectionId, pluginId),
       closeTab: () => emit("closeTab"),
       saveFile: (_pluginId, request, data) => savePluginFile(request, data),
+      copyText: (_pluginId, text) => copyToClipboard(text),
     },
     appLocale.value,
     currentBridgeTheme(),
   );
+  // An iframe reload (F5 / webview restart) drops the plugin sidecar's
+  // in-memory connection registry while the host still holds the connection
+  // open. Re-push the connection config through the same path as a sidebar
+  // open before the plugin receives its fresh init, so it can reconnect
+  // without the user reopening the connection from the sidebar.
+  bridge.onReinit = async () => {
+    const connectionId = props.context?.connectionId;
+    if (!connectionId) return;
+    await useConnectionStore().repushPluginConnection(connectionId);
+  };
 }
 
 /** Keep a plugin-supplied name from smuggling path separators or traversal into the save dialog. */
@@ -159,6 +175,7 @@ async function inlineLocalUiAssets(html: string, pluginId: string): Promise<stri
 
 async function loadWorkbench() {
   const generation = ++loadGeneration;
+  bridge?.dispose();
   bridge = undefined;
   loading.value = true;
   frameReady.value = false;
@@ -232,10 +249,18 @@ watch(appLocale, (locale) => bridge?.updateLocale(locale));
 // path — dark/light, palette switch, custom colors — re-pushes the resolved
 // tokens; watching isDark/custom colors alone misses palette-only switches.
 watch(themeRevision, () => bridge?.updateTheme(currentBridgeTheme()));
+// Font settings are applied outside applyTheme() (see App.vue applyUiFontFamily)
+// and therefore never bump themeRevision; watch them explicitly so font token
+// changes reach live plugin bridges without waiting for the next theme switch.
+watch(
+  () => [settingsStore.editorSettings.uiFontFamily, settingsStore.editorSettings.fontFamily, settingsStore.editorSettings.fontSize],
+  () => bridge?.updateTheme(currentBridgeTheme()),
+);
 
 onBeforeUnmount(() => {
   disposed = true;
   loadGeneration += 1;
+  bridge?.dispose();
   bridge = undefined;
   window.removeEventListener("message", onMessage);
   unsubscribeEvents?.();
@@ -253,7 +278,7 @@ onBeforeUnmount(() => {
       <span>{{ error }}</span>
     </div>
     <template v-else>
-      <iframe ref="iframe" :title="title" :srcdoc="source" sandbox="allow-scripts" referrerpolicy="no-referrer" class="size-full border-0 bg-transparent" @load="onFrameLoad" />
+      <iframe ref="iframe" :title="title" :srcdoc="source" sandbox="allow-scripts" allow="clipboard-write" referrerpolicy="no-referrer" class="size-full border-0 bg-transparent" @load="onFrameLoad" />
       <!-- Cover until the frame has actually painted: the iframe stays mounted
            underneath so its load event can fire (v-else on the overlay would
            deadlock), it just isn't visible yet. Fully opaque so the covered

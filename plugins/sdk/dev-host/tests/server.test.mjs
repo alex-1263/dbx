@@ -262,6 +262,28 @@ test("source watching is opt-in and automatic restarts preserve saved connection
   await new Promise((resolve) => setTimeout(resolve, 650));
   assert.equal(builds, 1);
 });
+
+test("auto-reload preference persists across dev host restarts", async (t) => {
+  let second;
+  t.after(() => second?.close());
+  const first = await fixture(t);
+  assert.equal((await first.request("auto-reload", { enabled: true })).value.enabled, true);
+  await first.host.close();
+  second = await createMockHost({
+    project: first.root,
+    uiRoot: "ui",
+    backend: process.execPath,
+    diagnostics: new Diagnostics(() => {}),
+    backendArgs: [fileURLToPath(new URL("./echo-sidecar.mjs", import.meta.url))],
+    dataDir: join(first.root, "data"),
+    shellHtml: join(first.root, "ui/index.html"),
+    port: 0,
+    backendWatch: first.root,
+    buildBackend: async () => {},
+  });
+  const bootstrap = await (await fetch(`${second.origin}/api/bootstrap`)).json();
+  assert.equal(bootstrap.autoReload, true);
+});
 test("agent diagnostics is read-only, bounded and does not log its own polling", async (t) => {
   const { host } = await fixture(t, true);
   const url = `${host.origin}/api/diagnostics`,
