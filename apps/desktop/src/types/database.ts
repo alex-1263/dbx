@@ -1497,6 +1497,8 @@ export interface TreeNode {
   savedSqlFolderId?: string;
   /** Set on synthetic table virtual-group container nodes. */
   vgroupId?: string;
+  /** 投影时盖章的分组类别（tables/views/…），供拖拽落点 O(1) 类别判定。 */
+  vgroupKind?: string;
   meta?: ColumnInfo | IndexInfo | ForeignKeyInfo | TriggerInfo | ConstraintInfo | PartitionInfo | SubpartitionInfo | ExtensionInfo | VectorCollectionMeta | MongoCollectionMeta | CustomTypeTreeMemberMeta;
   loadMore?: {
     parentId: string;

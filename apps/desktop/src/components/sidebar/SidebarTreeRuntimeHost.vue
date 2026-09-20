@@ -6142,6 +6142,15 @@ function buildSpecialSidebarMenu(context: SidebarMenuFactoryContext): boolean {
 
 function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
   const { node, items, deleteMenuLabel, deleteMenuAction, truncateMenuLabel, truncateMenuAction, emptyMenuLabel, emptyMenuAction, batchAutoIncrementCount, autoIncrementMenuLabel, autoIncrementMenuAction } = context;
+  // 虚拟分组移动入口：对所有可分组行类型统一注入（含 procedure/function/trigger/
+  // sequence/event/synonym/job/package/type 等专属分支——它们各自 return true，
+  // 若只在 table/view/mv 分支注入，这些行将没有任何分组入口）。表行保持原行为
+  // （simple 模式也能经「移动到新分组」建组）；其余行须已处于同类别分组容器内，
+  // 否则解析不出 scope，菜单只会静默失败。
+  if (isTableVGroupGroupableRowType(node.type) && (node.type === "table" || !!tableVGroupScopeKey(resolveTableVGroupScopeFromNode(connectionStore.treeNodes, node)))) {
+    const vgroupMoveItems = buildTableVGroupMoveMenuItems(node);
+    if (vgroupMoveItems.length) items.push({ label: t("tableVGroup.moveToGroup"), icon: FolderInput, children: vgroupMoveItems });
+  }
   // 6. Table / View / Materialized View
   if (node.type === "table" || node.type === "view" || node.type === "materialized_view") {
     if (currentDatabaseType() === "victoriametrics" && node.type === "table") {
@@ -6160,12 +6169,6 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     }
     const destructiveActions: ContextMenuItem[] = [];
     items.push(copyNameMenuItem());
-    // 表行保持原行为（simple 模式也能经「移动到新分组」建组）；视图/过程/触发器行
-    // 必须已处于同类别分组容器内，否则解析不出 scope，菜单只会静默失败。
-    if (isTableVGroupGroupableRowType(node.type) && (node.type === "table" || !!tableVGroupScopeKey(resolveTableVGroupScopeFromNode(connectionStore.treeNodes, node)))) {
-      const vgroupMoveItems = buildTableVGroupMoveMenuItems(node);
-      if (vgroupMoveItems.length) items.push({ label: t("tableVGroup.moveToGroup"), icon: FolderInput, children: vgroupMoveItems });
-    }
     items.push({ label: t("contextMenu.newQuery"), action: newQuery, icon: TerminalSquare });
     if (node.type === "table" && supportsAiAssistantContext(currentDatabaseType())) {
       items.push(addToAiMenuItem(node));

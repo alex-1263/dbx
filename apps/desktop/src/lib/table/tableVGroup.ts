@@ -395,20 +395,24 @@ interface TableVGroupFlatRow {
   flatIndex: number;
 }
 
-/** 成员行查找：rowType 给定时按 (类型, 名字) 精确匹配（包 spec/body 同名双行），否则回退同名首行（历史条目与表）。 */
-function findRowIn(rows: Map<string, TableVGroupFlatRow>, name: string, rowType?: string): TableVGroupFlatRow | undefined {
-  if (rowType) return rows.get(`${rowType}\u0000${name}`);
-  for (const row of rows.values()) if (row.node.label === name) return row;
-  return undefined;
+/** 双索引成员行查找：rowType 精确键 O(1)；无 rowType（历史条目与表）走同名首行索引 O(1)。 */
+interface TableVGroupRowLookup {
+  byKey: Map<string, TableVGroupFlatRow>;
+  byLabel: Map<string, TableVGroupFlatRow>;
+}
+
+function findRowIn(lookup: TableVGroupRowLookup, name: string, rowType?: string): TableVGroupFlatRow | undefined {
+  if (rowType) return lookup.byKey.get(`${rowType}\u0000${name}`);
+  return lookup.byLabel.get(name);
 }
 
 const tableRowKey = (type: string, label: string): string => `${type}\u0000${label}`;
 
-function buildVGroupChildNodes(entries: TableVGroupOrderEntry[], layout: TableVGroupLayout, rows: Map<string, TableVGroupFlatRow>, scope: TableVGroupScope): TreeNode[] {
+function buildVGroupChildNodes(entries: TableVGroupOrderEntry[], layout: TableVGroupLayout, lookup: TableVGroupRowLookup, scope: TableVGroupScope): TreeNode[] {
   const nodes: TreeNode[] = [];
   for (const entry of entries) {
     if (entry.type === "table") {
-      const row = findRowIn(rows, entry.name, entry.rowType);
+      const row = findRowIn(lookup, entry.name, entry.rowType);
       if (row) nodes.push(row.node);
       continue;
     }
@@ -424,8 +428,9 @@ function buildVGroupChildNodes(entries: TableVGroupOrderEntry[], layout: TableVG
       schema: scope.schema,
       linkedServer: scope.linkedServer,
       vgroupId: entry.id,
+      vgroupKind: scope.objectType ?? "tables",
       isExpanded: !group.collapsed,
-      children: buildVGroupChildNodes(entryChildren(entry), layout, rows, scope),
+      children: buildVGroupChildNodes(entryChildren(entry), layout, lookup, scope),
     });
   }
   return nodes;
@@ -436,12 +441,12 @@ function buildVGroupChildNodes(entries: TableVGroupOrderEntry[], layout: TableVG
  * of the container in layout order (matching Navicat's table groups), followed
  * by ungrouped rows and non-member rows at their original flat positions.
  */
-function buildVGroupRootNodes(entries: TableVGroupOrderEntry[], layout: TableVGroupLayout, rows: Map<string, TableVGroupFlatRow>, scope: TableVGroupScope): Array<{ node: TreeNode; sortIndex: number }> {
+function buildVGroupRootNodes(entries: TableVGroupOrderEntry[], layout: TableVGroupLayout, lookup: TableVGroupRowLookup, scope: TableVGroupScope): Array<{ node: TreeNode; sortIndex: number }> {
   const out: Array<{ node: TreeNode; sortIndex: number }> = [];
   let groupSeq = 0;
   for (const entry of entries) {
     if (entry.type === "table") {
-      const row = findRowIn(rows, entry.name, entry.rowType);
+      const row = findRowIn(lookup, entry.name, entry.rowType);
       if (row) out.push({ node: row.node, sortIndex: row.flatIndex });
       continue;
     }
@@ -458,8 +463,9 @@ function buildVGroupRootNodes(entries: TableVGroupOrderEntry[], layout: TableVGr
         schema: scope.schema,
         linkedServer: scope.linkedServer,
         vgroupId: entry.id,
+        vgroupKind: scope.objectType ?? "tables",
         isExpanded: !group.collapsed,
-        children: buildVGroupChildNodes(entryChildren(entry), layout, rows, scope),
+        children: buildVGroupChildNodes(entryChildren(entry), layout, lookup, scope),
       },
       // -1e6 keeps every group above flat rows while preserving layout order among groups.
       sortIndex: -1_000_000 + groupSeq++,
@@ -485,15 +491,17 @@ export function applyTableVGroupsToChildren(children: TreeNode[], layout: TableV
 
   // scope.objectType 决定哪些行参与分组；缺省 tables 维持既有表分组行为。
   const rowTypes = TABLE_VGROUP_KIND_ROW_TYPES[scope.objectType ?? "tables"];
-  const rows = new Map<string, TableVGroupFlatRow>();
+  const rows: TableVGroupRowLookup = { byKey: new Map(), byLabel: new Map() };
   const passthrough: Array<{ node: TreeNode; sortIndex: number }> = [];
   for (let i = 0; i < flatChildren.length; i++) {
     const node = flatChildren[i]!;
-    // 键为 (行类型, 名字)：包 spec/body 同名双行可各自独立成组员。
-    if (rowTypes[node.type] && !rows.has(tableRowKey(node.type, node.label))) rows.set(tableRowKey(node.type, node.label), { node, flatIndex: i });
-    else passthrough.push({ node, sortIndex: i });
+    // 键为 (行类型, 名字)：包 spec/body 同名双行可各自独立成组员；同名首行别名供历史条目按名匹配。
+    if (rowTypes[node.type] && !rows.byKey.has(tableRowKey(node.type, node.label))) {
+      rows.byKey.set(tableRowKey(node.type, node.label), { node, flatIndex: i });
+      if (!rows.byLabel.has(node.label)) rows.byLabel.set(node.label, { node, flatIndex: i });
+    } else passthrough.push({ node, sortIndex: i });
   }
-  if (!rows.size) return flatChildren;
+  if (!rows.byKey.size) return flatChildren;
 
   const rootBuilt = buildVGroupRootNodes(activeLayout.order, activeLayout, rows, scope);
   // Rows the layout does not reference stay ungrouped at their original slot.
@@ -505,7 +513,7 @@ export function applyTableVGroupsToChildren(children: TreeNode[], layout: TableV
     }
   };
   consume(rootBuilt.map((item) => item.node));
-  for (const row of rows.values()) {
+  for (const row of rows.byKey.values()) {
     if (!consumed.has(row.node)) passthrough.push({ node: row.node, sortIndex: row.flatIndex });
   }
 
@@ -548,14 +556,17 @@ export function stripTableVGroupsFromChildren(children: TreeNode[]): TreeNode[] 
  */
 export function findTableVGroupContainerNode(nodes: TreeNode[], scope: TableVGroupScope, memberLabel?: string, memberType?: string): TreeNode | null {
   const matchesOptional = (nodeValue: string | undefined, scopeValue: string | undefined) => nodeValue === scopeValue || !nodeValue || !scopeValue;
-  // 目标类别：memberType（行解析）或 scope.objectType（重投影）都把候选收敛到同类容器。
+  // 目标类别：memberType（行解析）按成员类型收敛；scope.objectType（重投影）按
+  // 类别收敛；tables 作用域（缺省）也必须收敛到 tables——否则其它类别的容器会混入
+  // 候选池，tables 的无成员写入（建组/改名/折叠等）可能误路由过去并抹掉其分组投影。
   const scopeKind = scope.objectType && scope.objectType !== "tables" ? scope.objectType : null;
+  const expectedKind = scopeKind ?? (memberType ? null : "tables");
   const memberRowTypes = memberType ? { [memberType]: true as const } : TABLE_VGROUP_KIND_ROW_TYPES[scope.objectType ?? "tables"];
   const candidates: TreeNode[] = [];
   const walk = (list: TreeNode[]) => {
     for (const node of list) {
       const kind = tableVGroupKindOfContainerNode(node);
-      const kindMatches = !scopeKind ? !memberType || (kind !== null && TABLE_VGROUP_KIND_ROW_TYPES[kind][memberType]) : kind === scopeKind;
+      const kindMatches = expectedKind ? kind === expectedKind : kind !== null && TABLE_VGROUP_KIND_ROW_TYPES[kind][memberType!];
       if (
         kindMatches &&
         isTableVGroupContainerNode(node) &&
