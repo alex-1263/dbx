@@ -6576,20 +6576,21 @@ function buildTableVGroupMoveMenuItems(node: TreeNode): ContextMenuItem[] {
   const layout = connectionStore.tableVGroupLayoutFor(node);
   const targets = selectedTableVGroupMoveTargets(node, selectedTreeNodesInVisibleOrder());
   const targetNames = targets.map((target) => target.label);
-  const targetsInGroup = (groupId: string) => targetNames.every((name) => tableVGroupPathForTable(layout, name).includes(groupId));
+  const targetRowType = targets[0]?.type;
+  const targetsInGroup = (groupId: string) => targetNames.every((name) => tableVGroupPathForTable(layout, name, targetRowType).includes(groupId));
   const items: ContextMenuItem[] = tableVGroupDestinationRows(layout).map((row) => ({
     label: row.name,
     title: row.path.join(" / "),
     disabled: targetNames.length > 0 && targetsInGroup(row.id),
     action: () => {
-      for (const name of targetNames) connectionStore.moveTableToVGroup(node, name, row.id);
+      for (const name of targetNames) connectionStore.moveTableToVGroup(node, name, row.id, targetRowType);
     },
   }));
-  if (targetNames.some((name) => tableVGroupPathForTable(layout, name).length > 0)) {
+  if (targetNames.some((name) => tableVGroupPathForTable(layout, name, targetRowType).length > 0)) {
     items.push({
       label: t("tableVGroup.removeFromGroup"),
       action: () => {
-        for (const name of targetNames) connectionStore.moveTableToVGroup(node, name, null);
+        for (const name of targetNames) connectionStore.moveTableToVGroup(node, name, null, targetRowType);
       },
     });
   }

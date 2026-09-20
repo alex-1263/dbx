@@ -1433,7 +1433,7 @@ function onTableReferenceMouseUp(event: MouseEvent) {
     suppressNextTableReferenceClick = true;
     const dropTarget = tableVGroupDropTargetFor(payload, event);
     if (dropTarget) {
-      for (const tableName of vgroupDragTableNames) connectionStore.moveTableToVGroup(dropTarget.node, tableName, dropTarget.groupId);
+      for (const tableName of vgroupDragTableNames) connectionStore.moveTableToVGroup(dropTarget.node, tableName, dropTarget.groupId, activeNode.value.type);
     } else {
       const target = document.elementFromPoint(event.clientX, event.clientY);
       if (target instanceof Element && target.closest(`[data-query-editor-root], ${AI_ASSISTANT_TABLE_DROP_ROOT_SELECTOR}`)) {

@@ -194,8 +194,13 @@ function containsGroup(entry: TableVGroupOrderEntry, groupId: string): boolean {
   return entryChildren(entry).some((child) => containsGroup(child, groupId));
 }
 
-function removeTableFromEntries(entries: TableVGroupOrderEntry[], tableName: string): TableVGroupOrderEntry[] {
-  return entries.filter((entry) => !(entry.type === "table" && entry.name === tableName)).map((entry) => (entry.type === "group" ? { type: "group" as const, id: entry.id, children: removeTableFromEntries(entryChildren(entry), tableName) } : entry));
+/** 成员条目与 (名字, 行类型) 的匹配：rowType 给定时旧的无类型条目（历史数据）也视为命中。 */
+function matchesTableEntry(entry: TableVGroupOrderEntry, name: string, rowType?: string): boolean {
+  return entry.type === "table" && entry.name === name && (!rowType || !entry.rowType || entry.rowType === rowType);
+}
+
+function removeTableFromEntries(entries: TableVGroupOrderEntry[], tableName: string, rowType?: string): TableVGroupOrderEntry[] {
+  return entries.filter((entry) => !matchesTableEntry(entry, tableName, rowType)).map((entry) => (entry.type === "group" ? { type: "group" as const, id: entry.id, children: removeTableFromEntries(entryChildren(entry), tableName, rowType) } : entry));
 }
 
 function expandGroup(layout: TableVGroupLayout, groupId: string): TableVGroupLayout {
@@ -205,10 +210,10 @@ function expandGroup(layout: TableVGroupLayout, groupId: string): TableVGroupLay
   };
 }
 
-export function moveTableToVGroup(layout: TableVGroupLayout, tableName: string, targetGroupId: string | null): TableVGroupLayout {
+export function moveTableToVGroup(layout: TableVGroupLayout, tableName: string, targetGroupId: string | null, rowType?: string): TableVGroupLayout {
   if (!hasTableVGroupEntries(layout)) return layout;
-  const order = removeTableFromEntries(cloneEntries(layout.order), tableName);
-  const entry: TableVGroupOrderEntry = { type: "table", name: tableName };
+  const order = removeTableFromEntries(cloneEntries(layout.order), tableName, rowType);
+  const entry: TableVGroupOrderEntry = { type: "table", name: tableName, ...(rowType ? { rowType } : {}) };
 
   if (targetGroupId) {
     const group = findGroupEntry(order, targetGroupId);
@@ -367,11 +372,11 @@ export function tableVGroupDestinationRows(layout: TableVGroupLayout | null | un
 }
 
 /** Stable root-to-leaf group-id path containing the table, empty when ungrouped. */
-export function tableVGroupPathForTable(layout: TableVGroupLayout | null | undefined, tableName: string): string[] {
+export function tableVGroupPathForTable(layout: TableVGroupLayout | null | undefined, tableName: string, rowType?: string): string[] {
   if (!hasTableVGroupEntries(layout)) return [];
   const walk = (entries: TableVGroupOrderEntry[], path: string[]): string[] | null => {
     for (const entry of entries) {
-      if (entry.type === "table" && entry.name === tableName) return path;
+      if (matchesTableEntry(entry, tableName, rowType)) return path;
       if (entry.type !== "group") continue;
       const found = walk(entryChildren(entry), [...path, entry.id]);
       if (found) return found;
@@ -390,11 +395,20 @@ interface TableVGroupFlatRow {
   flatIndex: number;
 }
 
+/** 成员行查找：rowType 给定时按 (类型, 名字) 精确匹配（包 spec/body 同名双行），否则回退同名首行（历史条目与表）。 */
+function findRowIn(rows: Map<string, TableVGroupFlatRow>, name: string, rowType?: string): TableVGroupFlatRow | undefined {
+  if (rowType) return rows.get(`${rowType}\u0000${name}`);
+  for (const row of rows.values()) if (row.node.label === name) return row;
+  return undefined;
+}
+
+const tableRowKey = (type: string, label: string): string => `${type}\u0000${label}`;
+
 function buildVGroupChildNodes(entries: TableVGroupOrderEntry[], layout: TableVGroupLayout, rows: Map<string, TableVGroupFlatRow>, scope: TableVGroupScope): TreeNode[] {
   const nodes: TreeNode[] = [];
   for (const entry of entries) {
     if (entry.type === "table") {
-      const row = rows.get(entry.name);
+      const row = findRowIn(rows, entry.name, entry.rowType);
       if (row) nodes.push(row.node);
       continue;
     }
@@ -427,7 +441,7 @@ function buildVGroupRootNodes(entries: TableVGroupOrderEntry[], layout: TableVGr
   let groupSeq = 0;
   for (const entry of entries) {
     if (entry.type === "table") {
-      const row = rows.get(entry.name);
+      const row = findRowIn(rows, entry.name, entry.rowType);
       if (row) out.push({ node: row.node, sortIndex: row.flatIndex });
       continue;
     }
@@ -475,7 +489,8 @@ export function applyTableVGroupsToChildren(children: TreeNode[], layout: TableV
   const passthrough: Array<{ node: TreeNode; sortIndex: number }> = [];
   for (let i = 0; i < flatChildren.length; i++) {
     const node = flatChildren[i]!;
-    if (rowTypes[node.type] && !rows.has(node.label)) rows.set(node.label, { node, flatIndex: i });
+    // 键为 (行类型, 名字)：包 spec/body 同名双行可各自独立成组员。
+    if (rowTypes[node.type] && !rows.has(tableRowKey(node.type, node.label))) rows.set(tableRowKey(node.type, node.label), { node, flatIndex: i });
     else passthrough.push({ node, sortIndex: i });
   }
   if (!rows.size) return flatChildren;
@@ -531,7 +546,7 @@ export function stripTableVGroupsFromChildren(children: TreeNode[]): TreeNode[] 
  * a functions-layout change could fall back onto the database container and
  * strip the tables grouping out of it.
  */
-export function findTableVGroupContainerNode(nodes: TreeNode[], scope: TableVGroupScope, memberLabel?: string, memberType?: TreeNode["type"]): TreeNode | null {
+export function findTableVGroupContainerNode(nodes: TreeNode[], scope: TableVGroupScope, memberLabel?: string, memberType?: string): TreeNode | null {
   const matchesOptional = (nodeValue: string | undefined, scopeValue: string | undefined) => nodeValue === scopeValue || !nodeValue || !scopeValue;
   // 目标类别：memberType（行解析）或 scope.objectType（重投影）都把候选收敛到同类容器。
   const scopeKind = scope.objectType && scope.objectType !== "tables" ? scope.objectType : null;
@@ -591,17 +606,20 @@ export function normalizeTableVGroupLayout(value: unknown): TableVGroupLayout {
   const normalizeEntries = (entries: unknown): TableVGroupOrderEntry[] => {
     const out: TableVGroupOrderEntry[] = [];
     if (!Array.isArray(entries)) return out;
-    // 同一层里重复的表名或分组引用会投影出重复节点（渲染以 id 作 key），
-    // 损坏的持久化数据必须在归一化这一步收敛。
+    // 同一层里重复的成员条目或分组引用会投影出重复节点（渲染以 id 作 key），
+    // 损坏的持久化数据必须在归一化这一步收敛。去重键含行类型：包 spec/body
+    // 同名双行是合法共存，不算重复。
     const seenTableNames = new Set<string>();
     const seenGroupEntries = new Set<string>();
     for (const entry of entries) {
       if (!entry || typeof entry !== "object") continue;
       const candidate = entry as Partial<TableVGroupOrderEntry>;
       if (candidate.type === "table") {
-        if (typeof candidate.name !== "string" || !candidate.name || seenTableNames.has(candidate.name)) continue;
-        seenTableNames.add(candidate.name);
-        out.push({ type: "table", name: candidate.name });
+        const rowType = typeof candidate.rowType === "string" ? candidate.rowType : undefined;
+        const dedupeKey = `${rowType ?? ""}\u0000${candidate.name}`;
+        if (typeof candidate.name !== "string" || !candidate.name || seenTableNames.has(dedupeKey)) continue;
+        seenTableNames.add(dedupeKey);
+        out.push({ type: "table", name: candidate.name, ...(rowType ? { rowType } : {}) });
       } else if (candidate.type === "group" && typeof candidate.id === "string" && candidate.id && validGroupIds.has(candidate.id) && !seenGroupEntries.has(candidate.id)) {
         seenGroupEntries.add(candidate.id);
         out.push({ type: "group", id: candidate.id, children: normalizeEntries(entryChildren(candidate as TableVGroupEntry)) });

@@ -8894,8 +8894,8 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   /** 分组节点是显示层投影：按已解析的作用域重建容器子节点，容器里不留投影副本。 */
-  function reprojectTableVGroupScope(scope: TableVGroupScope, scopeKey: string, tableName?: string) {
-    const container = findTableVGroupContainerNode(treeNodes.value, scope, tableName);
+  function reprojectTableVGroupScope(scope: TableVGroupScope, scopeKey: string, tableName?: string, rowType?: string) {
+    const container = findTableVGroupContainerNode(treeNodes.value, scope, tableName, rowType);
     if (!container?.children) return;
     container.children = applyTableVGroupsToChildren(stripTableVGroupsFromChildren(container.children), tableVGroupLayouts.value[scopeKey], scope);
   }
@@ -8919,20 +8919,20 @@ export const useConnectionStore = defineStore("connection", () => {
   }
 
   /** 写入某作用域的布局：即时重投影 + 合并 300ms 后落盘。作用域须已解析出 scopeKey。 */
-  function updateTableVGroupLayout(scope: TableVGroupScope, scopeKey: string, nextLayout: TableVGroupLayout, tableName?: string) {
+  function updateTableVGroupLayout(scope: TableVGroupScope, scopeKey: string, nextLayout: TableVGroupLayout, tableName?: string, rowType?: string) {
     tableVGroupLayouts.value = { ...tableVGroupLayouts.value, [scopeKey]: nextLayout };
     dirtyTableVGroupScopeKeys.add(scopeKey);
     scheduleTableVGroupPersistFlush();
-    reprojectTableVGroupScope(scope, scopeKey, tableName);
+    reprojectTableVGroupScope(scope, scopeKey, tableName, rowType);
   }
 
   /** 分组变更的统一入口：读当前布局 → 变换 → 写回。作用域不可解析或尚无布局时跳过。 */
-  function updateTableVGroupLayoutFor(scope: TableVGroupScope, transform: (layout: TableVGroupLayout) => TableVGroupLayout, tableName?: string) {
+  function updateTableVGroupLayoutFor(scope: TableVGroupScope, transform: (layout: TableVGroupLayout) => TableVGroupLayout, tableName?: string, rowType?: string) {
     const resolved = resolveTableVGroupScope(scope);
     if (!resolved) return;
     const current = tableVGroupLayouts.value[resolved.scopeKey];
     if (!current) return;
-    updateTableVGroupLayout(resolved.scope, resolved.scopeKey, transform(current), tableName);
+    updateTableVGroupLayout(resolved.scope, resolved.scopeKey, transform(current), tableName, rowType);
   }
 
   function rebuildTreeNodes() {
@@ -9784,8 +9784,8 @@ export const useConnectionStore = defineStore("connection", () => {
     deleteTableVGroups(scope: TableVGroupScope, groupIds: Iterable<string>) {
       updateTableVGroupLayoutFor(scope, (layout) => deleteTableVGroupsOp(layout, groupIds));
     },
-    moveTableToVGroup(scope: TableVGroupScope, tableName: string, groupId: string | null) {
-      updateTableVGroupLayoutFor(scope, (layout) => moveTableToVGroupOp(layout, tableName, groupId), tableName);
+    moveTableToVGroup(scope: TableVGroupScope, tableName: string, groupId: string | null, rowType?: string) {
+      updateTableVGroupLayoutFor(scope, (layout) => moveTableToVGroupOp(layout, tableName, groupId, rowType), tableName, rowType);
     },
     reorderTableVGroupEntry(scope: TableVGroupScope, draggedEntryId: string, targetEntryId: string, position: TableVGroupDropPosition) {
       updateTableVGroupLayoutFor(scope, (layout) => reorderTableVGroupEntryOp(layout, draggedEntryId, targetEntryId, position));
@@ -9796,9 +9796,9 @@ export const useConnectionStore = defineStore("connection", () => {
     setTableVGroupsEnabled(scope: TableVGroupScope, enabled: boolean) {
       updateTableVGroupLayoutFor(scope, (layout) => setTableVGroupsEnabledOp(layout, enabled));
     },
-    tableVGroupPathForTable(scope: TableVGroupScope, tableName: string) {
+    tableVGroupPathForTable(scope: TableVGroupScope, tableName: string, rowType?: string) {
       const resolved = resolveTableVGroupScope(scope);
-      return tableVGroupPathForTableOp(resolved ? tableVGroupLayouts.value[resolved.scopeKey] : undefined, tableName);
+      return tableVGroupPathForTableOp(resolved ? tableVGroupLayouts.value[resolved.scopeKey] : undefined, tableName, rowType);
     },
   };
 });
