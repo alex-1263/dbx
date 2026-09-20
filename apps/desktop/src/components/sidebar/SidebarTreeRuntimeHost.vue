@@ -84,7 +84,7 @@ import { canTreeNodePin, canTreeNodeShowExpander } from "@/lib/sidebar/sidebarTr
 import { sidebarConnectionVisibleFilterMenu } from "@/lib/sidebar/sidebarVisibleFilterMenu";
 import { supportsSidebarObjectNameFilter } from "@/lib/sidebar/sidebarObjectNameFilter";
 import { connectionGroupDestinationRows } from "@/lib/sidebar/sidebarLayout";
-import { hasTableVGroupEntries, selectedTableVGroupMoveTargets, tableVGroupDestinationRows, tableVGroupPathForTable, tableVGroupsEnabled } from "@/lib/table/tableVGroup";
+import { hasTableVGroupEntries, isTableVGroupContainerNode, isTableVGroupGroupableRowType, resolveTableVGroupScopeFromNode, selectedTableVGroupMoveTargets, tableVGroupDestinationRows, tableVGroupPathForTable, tableVGroupScopeKey, tableVGroupsEnabled } from "@/lib/table/tableVGroup";
 import { objectTypesForGroupNode } from "@/lib/table/tableTree";
 import { loadSidebarObjectGroup } from "@/lib/sidebar/sidebarObjectGroupRouting";
 import { requestObjectBrowserSearchFocus } from "@/lib/tabs/objectBrowserSearchFocus";
@@ -6160,7 +6160,9 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     }
     const destructiveActions: ContextMenuItem[] = [];
     items.push(copyNameMenuItem());
-    if (node.type === "table") {
+    // 表行保持原行为（simple 模式也能经「移动到新分组」建组）；视图/过程/触发器行
+    // 必须已处于同类别分组容器内，否则解析不出 scope，菜单只会静默失败。
+    if (isTableVGroupGroupableRowType(node.type) && (node.type === "table" || !!tableVGroupScopeKey(resolveTableVGroupScopeFromNode(connectionStore.treeNodes, node)))) {
       const vgroupMoveItems = buildTableVGroupMoveMenuItems(node);
       if (vgroupMoveItems.length) items.push({ label: t("tableVGroup.moveToGroup"), icon: FolderInput, children: vgroupMoveItems });
     }
@@ -6607,7 +6609,7 @@ function buildTableVGroupMoveMenuItems(node: TreeNode): ContextMenuItem[] {
 }
 
 function appendTableVGroupContainerItems(node: TreeNode, items: ContextMenuItem[]) {
-  if (node.type !== "database" && node.type !== "schema" && node.type !== "linked-server-schema" && node.type !== "group-tables") return;
+  if (!isTableVGroupContainerNode(node)) return;
   const layout = connectionStore.tableVGroupLayoutFor(node);
   if (!hasTableVGroupEntries(layout)) return;
   const enabled = tableVGroupsEnabled(layout);

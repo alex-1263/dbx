@@ -83,6 +83,7 @@ import {
   resolveTableVGroupScopeFromNode,
   setTableVGroupsEnabled as setTableVGroupsEnabledOp,
   stripTableVGroupsFromChildren,
+  tableVGroupKindOfContainerNode,
   tableVGroupPathForTable as tableVGroupPathForTableOp,
   tableVGroupScopeKey,
   toggleTableVGroupCollapsed as toggleTableVGroupCollapsedOp,
@@ -1869,7 +1870,8 @@ export const useConnectionStore = defineStore("connection", () => {
       persistPinnedTreeNodeIds();
     }
     syncPinnedTreeState(children);
-    children = applyTableVGroupsToChildren(children, tableVGroupLayoutForNode(parent), parent);
+    const vgroupResolved = resolveTableVGroupScope(parent);
+    children = applyTableVGroupsToChildren(children, vgroupResolved ? tableVGroupLayouts.value[vgroupResolved.scopeKey] : undefined, vgroupResolved?.scope ?? parent);
     parent.children = markRawLeafTreeNodes(children);
     loadedTreeNodeChildrenIds.value.add(parent.id);
     syncConfirmedEmptyTreeNodeId(parent);
@@ -6224,7 +6226,7 @@ export const useConnectionStore = defineStore("connection", () => {
           options?.onChildrenApplied?.(targetNode);
           if (!searchFilter && !isSidebarTableSearch && !tableNameFilter) {
             await savePersistedTreeChildren(cacheKey, children);
-            pruneTableVGroupStaleMembers(targetNode, children, targetNode.type === "group-tables");
+            pruneTableVGroupStaleMembers(targetNode, children, tableVGroupKindOfContainerNode(targetNode) !== null);
           }
           const currentTargetNode = treeNodeLoadTarget(load);
           if (currentTargetNode) currentTargetNode.isExpanded = true;
@@ -6391,6 +6393,9 @@ export const useConnectionStore = defineStore("connection", () => {
             setChildren(targetParent, nextChildren);
             if (!options?.searchFilter) {
               await savePersistedTreeChildren(objectGroupCacheKey(targetParent), nextChildren);
+              // procedures/triggers 等对象组在此分支提前 return，回收必须在 return 前；
+              // 非分组容器由 prune 内部的类别防护挡下。
+              pruneTableVGroupStaleMembers(targetParent, nextChildren, tableVGroupKindOfContainerNode(parent) !== null);
             }
             const currentTargetParent = treeNodeLoadRelatedTarget(load, parent);
             if (currentTargetParent && parentEpoch.isCurrent()) currentTargetParent.isExpanded = true;
@@ -6402,9 +6407,9 @@ export const useConnectionStore = defineStore("connection", () => {
           setChildren(targetParent, nextChildren);
           if (!options?.searchFilter) {
             await savePersistedTreeChildren(objectGroupCacheKey(targetParent), nextChildren);
-            // 只认 group-tables：group-views 等分组与表共用 scope_key，其列表不是全量表；
-            // 分页中间态（含 load-more）由 prune 内部再挡一次。
-            pruneTableVGroupStaleMembers(targetParent, nextChildren, parent.type === "group-tables");
+            // 各分组容器按自身类别回收完整列表的失效成员；分页中间态（含
+            // load-more）由 prune 内部再挡一次。
+            pruneTableVGroupStaleMembers(targetParent, nextChildren, tableVGroupKindOfContainerNode(parent) !== null);
           }
           const currentTargetParent = treeNodeLoadRelatedTarget(load, parent);
           if (currentTargetParent && parentEpoch.isCurrent()) currentTargetParent.isExpanded = true;
@@ -8876,11 +8881,6 @@ export const useConnectionStore = defineStore("connection", () => {
     return scopeKey ? { scope, scopeKey } : null;
   }
 
-  function tableVGroupLayoutForNode(node: TreeNode): TableVGroupLayout | undefined {
-    const resolved = resolveTableVGroupScope(node);
-    return resolved ? tableVGroupLayouts.value[resolved.scopeKey] : undefined;
-  }
-
   function scheduleTableVGroupPersistFlush() {
     if (tableVGroupPersistTimer) clearTimeout(tableVGroupPersistTimer);
     tableVGroupPersistTimer = setTimeout(() => {
@@ -8900,17 +8900,19 @@ export const useConnectionStore = defineStore("connection", () => {
     container.children = applyTableVGroupsToChildren(stripTableVGroupsFromChildren(container.children), tableVGroupLayouts.value[scopeKey], scope);
   }
 
-  /** 表分组成员回收：只有「本 scope 的完整表列表」才能判定成员存亡。
-   *  同一 scope_key 下并存多种列表：grouped 的各对象分组（视图/函数…只含非表行）、
-   *  simple 的库/模式表列表、以及分页中间态。非表列表或分页结果作为依据会把有效
-   *  成员误删并持久化，故列表语义由调用点声明（`completeTableList`），本函数只复核分页态。 */
+  /** 分组成员回收：只有「本 scope 的完整列表」才能判定成员存亡。
+   *  同一连接下并存多种列表：各分组容器（tables/views/procedures/triggers 各自的
+   *  完整列表）、非分组容器列表、以及分页中间态。非本容器类别的列表或分页结果作为
+   *  依据会把有效成员误删并持久化，故列表语义由调用点声明（`completeTableList`），
+   *  本函数复核容器类别与分页态，回收范围限定容器自身类别（objectType）。 */
   function pruneTableVGroupStaleMembers(parent: TreeNode, children: TreeNode[], completeTableList: boolean) {
-    if (!completeTableList) return;
+    const kind = tableVGroupKindOfContainerNode(parent);
+    if (!kind || !completeTableList) return;
     const resolved = resolveTableVGroupScope(parent);
     const layout = resolved ? tableVGroupLayouts.value[resolved.scopeKey] : undefined;
     if (!resolved || !hasTableVGroupEntries(layout)) return;
     if (hasTableTreeLoadMore(children)) return;
-    const keepNames = collectTableTreeNames(stripTableVGroupsFromChildren(children));
+    const keepNames = collectTableTreeNames(stripTableVGroupsFromChildren(children), kind);
     const next = pruneTableVGroupMembersOp(layout, keepNames);
     if (next === layout) return;
     updateTableVGroupLayout(resolved.scope, resolved.scopeKey, next);
