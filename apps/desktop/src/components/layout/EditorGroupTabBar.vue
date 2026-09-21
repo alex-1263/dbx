@@ -107,7 +107,7 @@ const emit = defineEmits<{
   "activate-tab": [tabId: string];
   "locate-tab": [tab: QueryTab];
   "toggle-zen-mode": [];
-  "start-resize": [event: MouseEvent];
+  "start-resize": [event: PointerEvent];
   "toggle-collapse": [];
   "detach-tab": [tab: QueryTab];
   "activate-settings": [];
@@ -416,13 +416,14 @@ function tabTitleText(tab: QueryTab) {
 }
 
 function tabConnectionLabel(tab: QueryTab) {
-  return connectionStore.getConfig(tab.connectionId)?.name || tab.connectionId;
+  // 连接已删除但页签被保留时，回退到原连接名，避免显示成裸 uuid。
+  return connectionStore.getConfig(tab.connectionId)?.name || tab.detachedConnectionName || tab.connectionId;
 }
 
 function tabConnectionTargetLabel(tab: QueryTab) {
   const connection = connectionStore.getConfig(tab.connectionId);
   const host = connection?.host.trim();
-  return connection && host ? `${host}:${connection.port}` : tab.connectionId;
+  return connection && host ? `${host}:${connection.port}` : tab.detachedConnectionName || tab.connectionId;
 }
 
 function databaseTabGroupBaseLabel(tab: QueryTab) {
@@ -1778,7 +1779,7 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
       </div>
     </div>
     <!-- Dragging any pane's handle resizes the shared vertical width; every pane follows. -->
-    <div v-if="isVerticalLayout && !isTabBarCollapsed" class="panel-resize-handle" :class="settingsStore.editorSettings.tabPlacement === 'right' ? 'panel-resize-handle--left' : 'panel-resize-handle--right'" @mousedown="emit('start-resize', $event)" />
+    <div v-if="isVerticalLayout && !isTabBarCollapsed" class="panel-resize-handle" :class="settingsStore.editorSettings.tabPlacement === 'right' ? 'panel-resize-handle--left' : 'panel-resize-handle--right'" @pointerdown="emit('start-resize', $event)" />
     <Dialog v-model:open="tabGroupEditorOpen">
       <DialogContent class="sm:max-w-[400px]">
         <DialogHeader>

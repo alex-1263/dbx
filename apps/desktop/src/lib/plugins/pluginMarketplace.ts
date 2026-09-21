@@ -1,4 +1,5 @@
 import type { InstalledPlugin, PluginMarketplaceArtifact, PluginMarketplacePlugin, PluginRepository, PluginRepositoryCatalogResult } from "@/types/database";
+import { uuid } from "@/lib/common/utils";
 
 export type MarketplacePluginStatus = "install" | "installed" | "update" | "unsupported";
 
@@ -15,6 +16,18 @@ export interface MarketplacePluginListing {
   installed?: InstalledPlugin;
   verified: boolean;
   status: MarketplacePluginStatus;
+}
+
+/**
+ * Returns the homepage only when it points somewhere different from the
+ * source repository. Marketplace metadata often repeats the repository URL in
+ * both fields, which otherwise renders two identical links.
+ */
+export function marketplaceHomepageUrl(source?: string, homepage?: string): string | undefined {
+  const normalizedSource = normalizeExternalUrl(source);
+  const normalizedHomepage = normalizeExternalUrl(homepage);
+  if (!normalizedHomepage || normalizedHomepage === normalizedSource) return undefined;
+  return homepage?.trim() || undefined;
 }
 
 export function buildMarketplacePluginListings(results: readonly PluginRepositoryCatalogResult[], installedPlugins: readonly InstalledPlugin[], locale: string): MarketplacePluginListing[] {
@@ -48,8 +61,48 @@ export function selectMarketplaceArtifact(artifacts: readonly PluginMarketplaceA
   return artifacts.find((candidate) => candidate.target === target) || artifacts.find((candidate) => candidate.target === UNIVERSAL_PLUGIN_TARGET);
 }
 
-function listingRepositoryCanVerify(repository: PluginRepository): boolean {
+export function listingRepositoryCanVerify(repository: PluginRepository): boolean {
   return repository.kind === "official" || repository.kind === "enterprise";
+}
+
+const INSTALL_BEACON_URL = "https://dbxio.com/api/plugins/install";
+const INSTALLATION_ID_STORAGE_KEY = "dbx-installation-id";
+const INSTALLATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+// Anonymous, purely random per-installation id so server-side stats can count
+// distinct machines without any user or hardware fingerprint. Clearing local
+// storage (or reinstalling) regenerates it, which is acceptable for
+// decorative statistics.
+function installationClientId(): string {
+  try {
+    if (typeof localStorage === "undefined") return "";
+    let id = localStorage.getItem(INSTALLATION_ID_STORAGE_KEY);
+    if (!id || !INSTALLATION_ID_PATTERN.test(id)) {
+      id = uuid();
+      localStorage.setItem(INSTALLATION_ID_STORAGE_KEY, id);
+    }
+    return id;
+  } catch {
+    return "";
+  }
+}
+
+export type PluginInstallBeaconKind = "install" | "update";
+
+// Fire-and-forget install beacon for marketplace statistics; never blocks or
+// fails the install. `kind` separates fresh installs from version updates so
+// update traffic cannot inflate the install numbers.
+export function beaconPluginInstall(pluginId: string, version: string, kind: PluginInstallBeaconKind = "install"): void {
+  try {
+    void fetch(INSTALL_BEACON_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: JSON.stringify({ id: pluginId, version, kind, clientId: installationClientId() }),
+      keepalive: true,
+    }).catch(() => undefined);
+  } catch {
+    // Statistics are best-effort.
+  }
 }
 
 export function filterMarketplacePluginListings(listings: readonly MarketplacePluginListing[], query: string, repositoryId: string): MarketplacePluginListing[] {
@@ -87,4 +140,17 @@ function parseVersion(version: string): [number, number, number, string] | null 
   const match = /^(\d+)\.(\d+)\.(\d+)(?:-([^+]+))?/.exec(version);
   if (!match) return null;
   return [Number(match[1]), Number(match[2]), Number(match[3]), match[4] || "~"];
+}
+
+function normalizeExternalUrl(value?: string): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  try {
+    const parsed = new URL(trimmed);
+    parsed.hash = "";
+    parsed.pathname = parsed.pathname.replace(/\/+$/, "") || "/";
+    return `${parsed.protocol.toLowerCase()}//${parsed.host.toLowerCase()}${parsed.pathname}${parsed.search}`;
+  } catch {
+    return trimmed.replace(/\/+$/, "").toLowerCase();
+  }
 }

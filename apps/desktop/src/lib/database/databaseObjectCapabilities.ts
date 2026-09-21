@@ -18,6 +18,7 @@ const MYSQL_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "PROCEDURE", "FUNCT
 // covers user-created types (enum/domain/composite/range/multirange/base);
 // relation auto-generated row types stay hidden.
 const POSTGRES_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "TYPE"];
+const OPENGAUSS_A_OBJECTS: SidebarObjectKind[] = [...POSTGRES_OBJECTS, "PACKAGE", "PACKAGE_BODY"];
 
 // KWDB is routed through the PostgreSQL pool but its pg_type catalog
 // compatibility is not verified yet, so it stays on the pre-TYPE object set.
@@ -32,7 +33,7 @@ const VASTBASE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VI
 
 const POSTGRES_LIKE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION"];
 const ORACLE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "SYNONYM", "PACKAGE", "PACKAGE_BODY"];
-const OCEANBASE_ORACLE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "PACKAGE", "PACKAGE_BODY"];
+const OCEANBASE_ORACLE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "SYNONYM", "PACKAGE", "PACKAGE_BODY"];
 const DAMENG_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "PACKAGE", "PACKAGE_BODY"];
 const XUGU_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "SYNONYM", "PACKAGE", "PACKAGE_BODY", "TYPE", "TYPE_BODY"];
 const PACKAGE_MEMBER_EXPANSION_DATABASES = new Set<DatabaseType>(["oracle", "xugu"]);
@@ -67,7 +68,7 @@ const DATABASE_TYPE_OBJECTS = new Map<DatabaseType, SidebarObjectKind[]>([
   ["duckdb", TABLE_VIEW_OBJECTS],
   ["clickhouse", TABLE_VIEW_OBJECTS],
   // Doris: backend listing path still uses the generic SHOW TABLES path (see
-  // `list_tables_once` for `PoolKind::Mysql` in crates/dbx-core/src/schema.rs)
+  // `list_tables_once` for `PoolKind::Mysql` in crates/dbx-core/src/schema/mod.rs)
   // and lacks a MV classifier. Keep Doris on TABLE_VIEW_OBJECTS until a
   // Doris-specific MV listing/classification lands, otherwise the UI advertises
   // MV support that the backend cannot route.
@@ -114,8 +115,8 @@ function isSourceReadableObjectKind(kind: SidebarObjectKind, dbType?: DatabaseTy
   return true;
 }
 
-export function databaseObjectCapabilities(dbType?: DatabaseType): DatabaseObjectCapabilities {
-  const sidebarObjects = sidebarObjectKindsForDatabase(dbType);
+export function databaseObjectCapabilities(dbType?: DatabaseType, compatibilityMode?: string): DatabaseObjectCapabilities {
+  const sidebarObjects = sidebarObjectKindsForDatabase(dbType, compatibilityMode);
   return {
     sidebarObjects,
     sourceReadable: sidebarObjects.filter((kind) => isSourceReadableObjectKind(kind, dbType)),
@@ -166,8 +167,9 @@ export function schemaDiffRoutineObjectTypesIntersection(sourceDbType?: Database
   return schemaDiffRoutineObjectTypes(targetDbType).filter((kind) => sourceTypes.has(kind));
 }
 
-export function sidebarObjectKindsForDatabase(dbType?: DatabaseType): SidebarObjectKind[] {
+export function sidebarObjectKindsForDatabase(dbType?: DatabaseType, compatibilityMode?: string): SidebarObjectKind[] {
   if (!dbType) return [...TABLE_VIEW_OBJECTS];
+  if (dbType === "opengauss" && compatibilityMode?.trim().toUpperCase() === "A") return [...OPENGAUSS_A_OBJECTS];
   return DATABASE_TYPE_OBJECTS.get(dbType) ?? [...ROUTINE_OBJECTS];
 }
 
@@ -202,8 +204,8 @@ export function customTypeCapabilities(dbType?: DatabaseType): CustomTypeCapabil
   return { details: supported, members: supported, ddl: supported };
 }
 
-export function supportsPackageMemberExpansion(dbType?: DatabaseType): boolean {
-  return !!dbType && PACKAGE_MEMBER_EXPANSION_DATABASES.has(dbType);
+export function supportsPackageMemberExpansion(dbType?: DatabaseType, compatibilityMode?: string): boolean {
+  return !!dbType && (PACKAGE_MEMBER_EXPANSION_DATABASES.has(dbType) || (dbType === "opengauss" && compatibilityMode?.trim().toUpperCase() === "A"));
 }
 
 export function normalizeSidebarObjectKind(type: string): SidebarObjectKind {
