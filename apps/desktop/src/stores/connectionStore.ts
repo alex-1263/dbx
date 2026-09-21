@@ -8881,6 +8881,24 @@ export const useConnectionStore = defineStore("connection", () => {
     return scopeKey ? { scope, scopeKey } : null;
   }
 
+  /** 立即落盘全部待写布局（清防抖计时器与脏集合）：initFromDisk 等整体覆盖内存布局的
+   *  路径必须先调用，否则窗口内 ≤300ms 的分组编辑会被旧快照静默回滚。 */
+  async function flushTableVGroupPersist(): Promise<void> {
+    if (tableVGroupPersistTimer) {
+      clearTimeout(tableVGroupPersistTimer);
+      tableVGroupPersistTimer = null;
+    }
+    if (!dirtyTableVGroupScopeKeys.size) return;
+    const pending = [...dirtyTableVGroupScopeKeys];
+    dirtyTableVGroupScopeKeys.clear();
+    await Promise.all(
+      pending.map((key) => {
+        const layout = tableVGroupLayouts.value[key];
+        return layout ? api.saveTableVGroups(key, layout).catch(() => {}) : Promise.resolve();
+      }),
+    );
+  }
+
   function scheduleTableVGroupPersistFlush() {
     if (tableVGroupPersistTimer) clearTimeout(tableVGroupPersistTimer);
     tableVGroupPersistTimer = setTimeout(() => {
@@ -9468,6 +9486,9 @@ export const useConnectionStore = defineStore("connection", () => {
     await settingsStore.initEditorSettings();
     if (!initFromDiskPromise) {
       initFromDiskPromise = (async () => {
+        // 整体覆盖内存布局前，先落盘窗口内未写盘的分组编辑（防止 300ms 防抖窗口
+        // 内的编辑被备份轮询/重载带回的旧快照静默回滚）。
+        await flushTableVGroupPersist();
         const [pinnedOrder, saved, , loadedTableVGroups] = await Promise.all([loadPinnedTreeNodeOrder(), api.loadConnections(), tunnelProfileStore.init(), api.loadTableVGroups()]);
         setPinnedTreeNodeOrder(pinnedOrder);
         await migrateTimeoutInheritance(saved);
